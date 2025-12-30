@@ -31,9 +31,19 @@ def initialize_app_structure():
         }),
         'use_udp': False,
         'use_web': False,
+        'use_loxone_vti': False,
+        'loxone_ip': '',
+        'loxone_user': '',
+        'loxone_pass': '',
+        'loxone_text_input': '',
         'web_service_url': '',
         'udp_service_port': 0,
+        'unknown_cleanup_days': 0,  # days; 0 disables cleanup
+
         'udp_service_url': '',
+        # If enabled, Face Recognition runs automatically every N frames.
+        # If disabled, Face Recognition runs only via manual /trigger.
+        'enable_face_recognition_interval': True,
         'face_recognition_interval': 60,
         'image_path': os.path.join('/data', 'saved_faces'),
         'log_file': os.path.join('/data', 'event_log.json')
