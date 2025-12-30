@@ -2,9 +2,11 @@ import os
 from flask import Flask, render_template, request, redirect, url_for, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
 import re
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 import logging
 import json
+import time
+import requests
 from flask import send_file
 
 UPLOAD_FOLDER = '/data/knownfaces'
@@ -28,7 +30,7 @@ def validate_int(value, default, min_value=None, max_value=None):
 
 def validate_bool(value, default):
     logging.debug(value)
-    if str(value).lower() in ['true', '1', 't', 'y', 'yes']:
+    if str(value).lower() in ['true', '1', 't', 'y', 'yes', 'on']:
         return True
     elif str(value).lower() in ['false', '0', 'f', 'n', 'no']:
         return False
@@ -104,6 +106,70 @@ class ConfigFrontend:
             except Exception as e:
                 return jsonify({'error': str(e)}), 500
 
+        
+        @self.app.route('/trigger', methods=['GET', 'POST'])
+        def manual_trigger():
+            # Defaults
+            try:
+                duration = float(request.args.get('duration', 5))
+            except ValueError:
+                duration = 5.0
+            try:
+                fps = float(request.args.get('fps', 3))
+            except ValueError:
+                fps = 3.0
+            stop_on_match = request.args.get('stop_on_match', '0')
+            stop_on_match = True if str(stop_on_match) in ('1', 'true', 'True', 'yes', 'on') else False
+
+            # Clamp
+            duration = max(0.5, min(duration, 120.0))
+            fps = max(0.1, min(fps, 10.0))
+
+            payload = {
+                'timestamp': time.time(),
+                'duration': duration,
+                'fps': fps,
+                'stop_on_match': stop_on_match,
+                # Force exactly one notification for a known face during this trigger window
+                'force_notify': True
+            }
+
+            trigger_file = os.path.join('/data', 'manual_trigger.json')
+            try:
+                with open(trigger_file, 'w') as f:
+                    json.dump(payload, f)
+                return jsonify({'status': 'ok', 'trigger': payload})
+            except Exception as e:
+                logging.error(f"Failed to write trigger file {trigger_file}: {e}")
+                return jsonify({'status': 'error', 'message': str(e)}), 500
+
+        
+
+        @self.app.route('/loxone-test', methods=['POST'])
+        def loxone_test():
+            # Test button: send a fixed name to Loxone Virtual Text Input
+            if not self.config_manager.get('use_loxone_vti'):
+                return jsonify({'status': 'error', 'message': 'Loxone Virtual Text Input is disabled'}), 400
+
+            ip = (self.config_manager.get('loxone_ip') or '').strip()
+            user = (self.config_manager.get('loxone_user') or '').strip()
+            pw = (self.config_manager.get('loxone_pass') or '').strip()
+            text_input = (self.config_manager.get('loxone_text_input') or '').strip()
+
+            if not ip or not user or not pw or not text_input:
+                return jsonify({'status': 'error', 'message': 'Missing Loxone configuration (IP/User/Pass/Texteingang)'}), 400
+
+            name = quote("FaceStream.AI", safe="")
+            text_input_enc = quote(text_input, safe="")
+            url = f"http://{user}:{pw}@{ip}/dev/sps/io/{text_input_enc}/{name}"
+
+            try:
+                r = requests.get(url, timeout=5)
+                if r.status_code >= 200 and r.status_code < 300:
+                    return jsonify({'status': 'ok', 'url': url}), 200
+                return jsonify({'status': 'error', 'message': f'Loxone responded with HTTP {r.status_code}', 'url': url}), 502
+            except Exception as e:
+                return jsonify({'status': 'error', 'message': str(e), 'url': url}), 502
         @self.app.route('/', methods=['GET', 'POST'])
         def index():
             print(self.config_manager.config)
@@ -126,10 +192,18 @@ class ConfigFrontend:
                     'use_udp': validate_bool(request.form.get('use_udp'), False),
                     'use_web': validate_bool(
                         request.form.get('use_web'), False),
+                    'use_loxone_vti': validate_bool(request.form.get('use_loxone_vti'), False),
+                    'loxone_ip': request.form.get('loxone_ip', '').strip(),
+                    'loxone_user': request.form.get('loxone_user', '').strip(),
+                    'loxone_pass': request.form.get('loxone_pass', '').strip(),
+                    'loxone_text_input': request.form.get('loxone_text_input', '').strip(),
                     'web_service_url': request.form.get('web_service_url'),
                     'udp_service_url': request.form.get('udp_service_url'),
                     'udp_service_port': validate_port(request.form.get('udp_service_port')),
                     'notification_delay': validate_int(request.form.get('notification_delay'), 60, 10, max_value=300),
+                    'enable_face_recognition_interval': validate_bool(
+                        request.form.get('enable_face_recognition_interval'), False
+                    ),
                     'face_recognition_interval': validate_int(request.form.get('face_recognition_interval'), 60, 2,
                                                               max_value=300)
                 }
