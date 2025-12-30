@@ -1,5 +1,5 @@
 # Erste Stufe: Builder-Image
-FROM python:3.8-slim-buster AS builder
+FROM python:3.8-slim-bullseye AS builder
 
 # Installieren der notwendigen Systempakete und Build-Tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -32,7 +32,7 @@ RUN pip3 install --upgrade pip && \
 RUN pip3 install face_recognition opencv-contrib-python-headless flask flask-requests requests psutil pandas
 
 # Zweite Stufe: Runtime-Image
-FROM python:3.8-slim-buster AS runtime
+FROM python:3.8-slim-bullseye AS runtime
 
 # Kopieren der virtuellen Umgebung vom Builder-Image
 COPY --from=builder /opt/venv /opt/venv
