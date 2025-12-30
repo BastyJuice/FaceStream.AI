@@ -4,6 +4,8 @@ import cv2
 import face_recognition
 import queue
 import time
+import os
+import json
 
 
 class FrameProcessor(threading.Thread):
@@ -15,6 +17,7 @@ class FrameProcessor(threading.Thread):
         config_manager.load_config()
         self.overlay_transparency = config_manager.get('overlay_transparency')
         self.overlay_color = config_manager.get('overlay_color')
+        self.enable_face_recognition_interval = config_manager.get('enable_face_recognition_interval', True)
         self.face_recognition_interval = config_manager.get('face_recognition_interval')
         self.face_loader = face_loader
         self.running = True
@@ -22,13 +25,61 @@ class FrameProcessor(threading.Thread):
         self.notification_service = notification_service
         self.frame_count = 0  # Zähler für die Frame-Intervalle
         self.scale_factor = 0.5
+        # Manual trigger state
+        self.trigger_file = os.path.join('/data', 'manual_trigger.json')
+        self._trigger_mtime = 0.0
+        self._trigger_active_until = 0.0
+        self._trigger_next_allowed = 0.0
+        self._trigger_fps = 0.0
+        self._trigger_stop_on_match = False
+        self._trigger_force_notify_pending = False
 
+
+    def _refresh_trigger(self):
+        """Reload trigger file if changed and update trigger window state."""
+        try:
+            if not os.path.exists(self.trigger_file):
+                return
+            mtime = os.path.getmtime(self.trigger_file)
+            if mtime <= self._trigger_mtime:
+                return
+            self._trigger_mtime = mtime
+
+            with open(self.trigger_file, 'r') as f:
+                data = json.load(f) if f.readable() else {}
+
+            now = time.time()
+            triggered_at = float(data.get('timestamp', now))
+            duration = float(data.get('duration', 5))
+            fps = float(data.get('fps', 3))
+            stop_on_match = bool(int(data.get('stop_on_match', 0))) if isinstance(data.get('stop_on_match', 0), str) else bool(data.get('stop_on_match', False))
+            force_notify = data.get('force_notify', True)
+            # Clamp values to safe ranges
+            duration = max(0.5, min(duration, 120.0))
+            fps = max(0.1, min(fps, 10.0))
+
+            self._trigger_active_until = triggered_at + duration
+            self._trigger_fps = fps
+            self._trigger_next_allowed = 0.0  # allow immediately
+            self._trigger_stop_on_match = stop_on_match
+            self._trigger_force_notify_pending = bool(force_notify)
+            logging.info(f"Manual trigger activated: duration={duration}s fps={fps} stop_on_match={stop_on_match} force_notify={force_notify}")
+        except Exception as e:
+            logging.error(f"Failed to refresh manual trigger: {e}")
     def run(self):
         while self.running:
             try:
                 frame = self.frame_queue.get()
                 if frame is not None:
-                    if self.frame_count % self.face_recognition_interval == 0:
+                    self._refresh_trigger()
+                    now = time.time()
+                    trigger_active = now <= self._trigger_active_until
+                    trigger_allow = trigger_active and (now >= self._trigger_next_allowed)
+                    if trigger_allow:
+                        # Throttle recognition during trigger window
+                        self._trigger_next_allowed = now + (1.0 / self._trigger_fps)
+                        processed_frame = self.process_frame(frame)
+                    elif self.enable_face_recognition_interval and (self.frame_count % self.face_recognition_interval == 0):
                         processed_frame = self.process_frame(frame)
                     else:
                         processed_frame = self.update_trackers(frame)  # Aktualisiere immer die Tracker
@@ -95,7 +146,19 @@ class FrameProcessor(threading.Thread):
             # Draw rectangles and notify
             name = self.face_loader.get_name(face_encoding)  # Assuming a method to get name
             marked_frame = self.draw_rectangle_with_name(marked_frame, top, right, bottom, left, name)
-            self.notification_service.notify(name, marked_frame)
+            # Trigger-aware notification: allow one forced notification per manual trigger
+            now = time.time()
+            trigger_active = now <= self._trigger_active_until
+            force = False
+            if trigger_active and self._trigger_force_notify_pending and name != 'Unknown':
+                force = True
+                self._trigger_force_notify_pending = False
+            self.notification_service.notify(name, marked_frame, force=force)
+
+            # Optionally stop trigger window on first known match
+            if trigger_active and self._trigger_stop_on_match and name != 'Unknown':
+                self._trigger_active_until = 0.0
+
 
             processing_time = time.time() - start_time
             logging.debug(f"Frame verarbeitet in {processing_time:.2f} Sekunden")
