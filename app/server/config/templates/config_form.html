@@ -35,6 +35,17 @@
                     <!-- linker Bereich -->
                     <section class="col-md-6">
                         <h3>General Settings</h3>
+                        <div class="alert alert-info mt-3" role="alert">
+                            <strong>Manual Trigger API</strong>
+                            <div class="mt-2">
+                                Starts face recognition on demand (even if the interval is disabled).
+                            </div>
+                            <div class="mt-2">
+                                <div><code>GET /trigger</code> or <code>POST /trigger</code> (defaults: 5s, 3 FPS)</div>
+                                <div><code>/trigger?duration=30&amp;fps=3</code></div>
+                                <div><code>/trigger?duration=30&amp;fps=2&amp;stop_on_match=1</code></div>
+                            </div>
+                        </div>
                         <div class="row mt-3">
                             <div class="col">
                                 <label for="inputStreamURL" class="form-label">Input Stream URL</label>
@@ -77,12 +88,22 @@
 
                         <div class="row mt-3">
                             <div class="col-8">
+                                <div class="form-check mb-2">
+                                    <input class="form-check-input" type="checkbox" id="enableFaceRecognitionInterval"
+                                           name="enable_face_recognition_interval"
+                                           {% if config.get('enable_face_recognition_interval', True) %}checked{% endif %}
+                                           onchange="toggleFaceRecognitionInterval()">
+                                    <label class="form-check-label" for="enableFaceRecognitionInterval">
+                                        Enable Face Recognition Interval
+                                    </label>
+                                </div>
                                 <label class="form-label" for="face_recognition_interval">Face Recognition Interval
                                     (Delay)</label>
                                 <input type="range" class="form-range" id="face_recognition_interval"
                                        name="face_recognition_interval" min="2" max="300"
                                        value="{{ config.face_recognition_interval }}"
-                                       oninput="updateFaceRecognitionIntervalValue(this.value)">
+                                       oninput="updateFaceRecognitionIntervalValue(this.value)"
+                                       {% if not config.get('enable_face_recognition_interval', True) %}disabled{% endif %}>
 
                                 <small> Every <span
                                         id="faceRecognitionIntervalValue">{{ config.face_recognition_interval }}</span></small>
@@ -186,6 +207,53 @@
                  <p class="alert alert-info">
                         <b>Note:</b> The messages are sent by the video server. You must use the host name of the video server if it is required for the message-receiving servers.
                     </p>
+<div class="col-12 mt-4">
+                    <h3>Loxone Virtual Text Input</h3>
+                    <div class="form-check mb-3">
+                        <input class="form-check-input" type="checkbox" id="use_loxone_vti" name="use_loxone_vti"
+                               {% if config.use_loxone_vti %}checked{% endif %} value="1">
+                        <label class="form-check-label" for="use_loxone_vti">
+                            Enable Loxone Virtual Text Input
+                        </label>
+                    </div>
+
+                    <div class="row">
+                        <div class="col-md-3 mb-3">
+                            <label for="loxone_ip" class="form-label">IP</label>
+                            <input type="text" class="form-control" id="loxone_ip" name="loxone_ip"
+                                   value="{{config.loxone_ip}}" placeholder="192.168.1.10">
+                        </div>
+                        <div class="col-md-3 mb-3">
+                            <label for="loxone_user" class="form-label">User</label>
+                            <input type="text" class="form-control" id="loxone_user" name="loxone_user"
+                                   value="{{config.loxone_user}}" placeholder="admin">
+                        </div>
+                        <div class="col-md-3 mb-3">
+                            <label for="loxone_pass" class="form-label">Pass</label>
+                            <input type="password" class="form-control" id="loxone_pass" name="loxone_pass"
+                                   value="{{config.loxone_pass}}" placeholder="••••••••">
+                        </div>
+                        <div class="col-md-3 mb-3">
+                            <label for="loxone_text_input" class="form-label">Texteingang</label>
+                            <input type="text" class="form-control" id="loxone_text_input" name="loxone_text_input"
+                                   value="{{config.loxone_text_input}}" placeholder="VTI_Name">
+                        </div>
+                    </div>
+                    
+                    <div class="row">
+                        <div class="col-12 mb-2">
+                            <button type="button" class="btn btn-outline-primary" id="loxone-test-btn">
+                                Test Loxone (send "FaceStream.AI")
+                            </button>
+                            <span id="loxone-test-result" class="ms-2"></span>
+                        </div>
+                    </div>
+                    <small class="text-muted">
+                        Sends a GET request to Loxone: <code>http://&lt;user&gt;:&lt;pass&gt;@&lt;ip&gt;/dev/sps/io/&lt;Texteingang&gt;/&lt;name&gt;</code>
+                        <br><br>
+                    </small>
+                </div>
+
                 <!-- UDP Messaging Service Configuration -->
                 <div class="col-md-6">
                     <h3>UDP Messaging Service</h3>
@@ -228,7 +296,9 @@
                                value="{{config.web_service_url}}">
                     </div>
                 </div>
+                
             </div>
+
 
             <!-- Notification Delay Slider -->
             <div class="row mt-4">
@@ -273,6 +343,25 @@
         <p class="alert alert-info">
             <b>Note:</b> The notification delay is used for event logging.
         </p>
+        <form method="post" id="eventlog-form" class="needs-validation" novalidate>
+            <div class="alert alert-primary">
+                <b>Clean up Unknown images</b><br>
+                Deletes <code>Unknown_*.jpg</code> images in <code>/event-image/</code> that are older than the configured number of days.<br><br>
+                <div class="row g-3 align-items-center">
+                    <div class="col-auto">
+                        <label for="unknown_cleanup_days" class="col-form-label">Delete Unknown images older than (days)</label>
+                    </div>
+                    <div class="col-auto">
+                        <input type="number" class="form-control" id="unknown_cleanup_days" name="unknown_cleanup_days"
+                               min="0" max="3650" value="{{ config.unknown_cleanup_days if config.unknown_cleanup_days is not none else 0 }}">
+                    </div>
+                    <div class="col-auto">
+                        <small class="form-text text-muted">0 = disabled</small>
+                    </div>
+                </div>
+            </div>
+        </form>
+
         <div id="eventlog-table"></div>
     </div>
 
@@ -280,7 +369,50 @@
 
 
 <script>
+function toggleFaceRecognitionInterval() {
+  const cb = document.getElementById('enableFaceRecognitionInterval');
+  const slider = document.getElementById('face_recognition_interval');
+  if (!cb || !slider) return;
+  slider.disabled = !cb.checked;
+}
 
+// Loxone test button
+document.addEventListener('DOMContentLoaded', function () {
+  // Ensure the slider is correctly enabled/disabled on load
+  toggleFaceRecognitionInterval();
+
+  const btn = document.getElementById('loxone-test-btn');
+  const out = document.getElementById('loxone-test-result');
+  if (!btn) return;
+
+  btn.addEventListener('click', async function () {
+    if (out) {
+      out.textContent = 'Sending...';
+      out.className = 'ms-2 text-muted';
+    }
+    try {
+      const resp = await fetch('/loxone-test', { method: 'POST' });
+      const data = await resp.json().catch(() => ({}));
+      if (resp.ok && data && data.status === 'ok') {
+        if (out) {
+          out.textContent = 'OK';
+          out.className = 'ms-2 text-success';
+        }
+      } else {
+        const msg = (data && data.message) ? data.message : ('HTTP ' + resp.status);
+        if (out) {
+          out.textContent = 'Error: ' + msg;
+          out.className = 'ms-2 text-danger';
+        }
+      }
+    } catch (e) {
+      if (out) {
+        out.textContent = 'Error: ' + (e && e.message ? e.message : e);
+        out.className = 'ms-2 text-danger';
+      }
+    }
+  });
+});
 </script>
 {% endblock %}
 
