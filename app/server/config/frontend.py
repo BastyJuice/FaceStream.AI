@@ -1,5 +1,7 @@
 import os
-from flask import Flask, render_template, request, redirect, url_for, jsonify, send_from_directory
+import shutil
+from pathlib import Path
+from flask import Flask, render_template, request, redirect, url_for, jsonify, send_from_directory, send_file
 from werkzeug.utils import secure_filename
 import re
 from urllib.parse import urlparse, quote
@@ -9,8 +11,61 @@ import time
 import requests
 from flask import send_file
 
+# Keep event log consistent when images are deleted via the GUI cleanup action.
+from notification.service import prune_event_log
+
 UPLOAD_FOLDER = '/data/knownfaces'
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
+
+
+def safe_path(base_dir: str, relative_path: str) -> str:
+    """Resolve a user-provided relative path safely under base_dir."""
+    base = Path(base_dir).resolve()
+    rel = (relative_path or "").lstrip("/").replace("\\", "/")
+    candidate = (base / rel).resolve()
+    # Ensure candidate is within base
+    if base == candidate or str(candidate).startswith(str(base) + os.sep):
+        return str(candidate)
+    raise ValueError("Invalid path")
+
+def sanitize_person_name(name: str) -> str:
+    """Turn user input into a safe folder name while keeping it readable."""
+    if name is None:
+        return ""
+    name = name.strip().strip('"').strip("'").strip()
+    # Replace path separators and other problematic chars
+    name = re.sub(r"[\\/\x00-\x1f:<>\|\?\*]+", "_", name)
+    # Collapse whitespace
+    name = re.sub(r"\s+", " ", name).strip()
+    return name
+
+
+def get_known_faces_structure(base_dir: str):
+    """Return dict: {person_name: [relative_paths...]}, plus root images under key '__root__'."""
+    persons = {}
+    root_images = []
+    if not os.path.isdir(base_dir):
+        return persons, root_images
+
+    for entry in sorted(os.listdir(base_dir)):
+        p = os.path.join(base_dir, entry)
+        if os.path.isdir(p):
+            person = entry
+            imgs = []
+            for fn in sorted(os.listdir(p)):
+                if fn.lower().endswith(('.jpg', '.jpeg', '.png')):
+                    imgs.append(f"{person}/{fn}")
+            if imgs:
+                persons[person] = imgs
+            else:
+                # still show empty persons in UI
+                persons.setdefault(person, [])
+        else:
+            if entry.lower().endswith(('.jpg', '.jpeg', '.png')):
+                root_images.append(entry)
+
+    return persons, root_images
+
 
 
 def allowed_file(filename):
@@ -176,13 +231,14 @@ class ConfigFrontend:
             hex_color = self.config_manager.rgb_to_hex(self.config_manager.get('overlay_color'))
             rgba_overlay = self.config_manager.get_rgba_overlay()
             transparency_value = int(round((self.config_manager.get('overlay_transparency')) * 100))
-            faces = os.listdir(UPLOAD_FOLDER)
+            persons, root_images = get_known_faces_structure(UPLOAD_FOLDER)
             if request.method == 'POST':
                 new_config = {
                     'input_stream_url': validate_url(request.form.get('input_stream_url'), ''),
                     'overlay_color': self.config_manager.hex_to_rgb(request.form.get('overlay_color')),
                     'overlay_transparency': validate_int(request.form.get('overlay_transparency'), 0, 0, 100) / 100,
                     'overlay_border': validate_int(request.form.get('overlay_border'), 1, 1, 4),
+                    'enable_face_overlay': validate_bool(request.form.get('enable_face_overlay'), True),
                     'output_width': validate_int(request.form.get('output_width'), 640, 100, 4000),
                     'output_height': validate_int(request.form.get('output_height'), 480, 100, 4000),
                     'custom_message_udp': request.form.get('custom_message_udp',
@@ -201,13 +257,29 @@ class ConfigFrontend:
                     'udp_service_url': request.form.get('udp_service_url'),
                     'udp_service_port': validate_port(request.form.get('udp_service_port')),
                     'notification_delay': validate_int(request.form.get('notification_delay'), 60, 10, max_value=300),
+                    'enable_stream_suspend': validate_bool(request.form.get('enable_stream_suspend'), False),
                     'enable_face_recognition_interval': validate_bool(
                         request.form.get('enable_face_recognition_interval'), False
                     ),
                     'face_recognition_interval': validate_int(request.form.get('face_recognition_interval'), 60, 2,
-                                                              max_value=300)
+                                                              max_value=300),
+                    'face_scale_factor': validate_float(request.form.get('face_scale_factor'), 0.75, 0.25, 1.0),
+                    'face_detection_model': (request.form.get('face_detection_model') or 'hog').strip().lower(),
+                    'face_match_threshold': validate_float(request.form.get('face_match_threshold'), 0.55, 0.30, 0.80),
+                    'enable_clahe': validate_bool(request.form.get('enable_clahe'), False),
+                    'enable_blur_filter': validate_bool(request.form.get('enable_blur_filter'), False),
+                    'blur_threshold': validate_float(request.form.get('blur_threshold'), 100.0, 0.0, 5000.0),
+                    'eventimage_cleanup_days': validate_int(request.form.get('eventimage_cleanup_days'), self.config_manager.get('eventimage_cleanup_days', 0), 0, max_value=3650)
                 }
                 combined = {**self.config_manager.config, **new_config}
+
+                # Normalize tuning options
+                if combined.get('face_detection_model') not in ('hog', 'cnn'):
+                    combined['face_detection_model'] = 'hog'
+
+                # Mutual exclusivity: stream suspend only allowed when interval is disabled
+                if combined.get('enable_face_recognition_interval', False):
+                    combined['enable_stream_suspend'] = False
 
                 self.config_manager.config = combined
                 self.config_manager.save_config()
@@ -224,114 +296,222 @@ class ConfigFrontend:
                     hex_color=hex_color,
                     transparency_value=transparency_value,
                     rgba_overlay=rgba_overlay,
-                    known_faces=faces
+                    persons=persons,
+                    root_images=root_images
                 )
 
         @self.app.route('/upload_faces', methods=['POST'])
         def upload_faces():
-            # Überprüfung, ob 'file' Teil der Anfrage ist
+            # Dropzone sends the file as 'file'
             if 'file' not in request.files:
-                return jsonify({'error': 'Keine Datei im Request gefunden'}), 400
+                return jsonify({'error': 'No file found in request'}), 400
 
             file = request.files['file']
-
-            # Überprüfung, ob ein Dateiname vorhanden ist
             if file.filename == '':
-                return jsonify({'error': 'Kein Dateiname angegeben'}), 400
+                return jsonify({'error': 'No filename provided'}), 400
+
+            # Person (folder) is required for the new UI; keep legacy behavior if missing
+            person_raw = request.form.get('person', '').strip()
+            person = sanitize_person_name(person_raw)
 
             if file and allowed_file(file.filename):
                 filename = secure_filename(file.filename)
-                file.save(os.path.join(UPLOAD_FOLDER, filename))
-                return jsonify({'message': f'Datei {filename} erfolgreich hochgeladen'}), 200
 
-            # Standard-Antwort, falls die Datei nicht den Anforderungen entspricht
-            return jsonify({'error': 'Ungültiges Dateiformat'}), 400
+                if person:
+                    person_dir = os.path.join(UPLOAD_FOLDER, person)
+                    os.makedirs(person_dir, exist_ok=True)
+                    save_path = os.path.join(person_dir, filename)
+                else:
+                    save_path = os.path.join(UPLOAD_FOLDER, filename)
 
-        @self.app.route('/delete_image/<filename>', methods=['POST'])
+                file.save(save_path)
+                return jsonify({'message': f'File {filename} uploaded successfully'}), 200
+
+            return jsonify({'error': 'Invalid file type'}), 400
+
+        @self.app.route('/create_person', methods=['POST'])
+        def create_person():
+            data = request.get_json(silent=True) or {}
+            person_raw = data.get('person') or request.form.get('person') or ''
+            person = sanitize_person_name(person_raw)
+            if not person:
+                return jsonify({'error': 'Person name is required'}), 400
+
+            person_dir = os.path.join(UPLOAD_FOLDER, person)
+            os.makedirs(person_dir, exist_ok=True)
+            return jsonify({'message': f'Person {person} angelegt', 'person': person}), 200
+
+
+        @self.app.route('/list-faces', methods=['GET'])
+        def list_faces():
+            # Returns the HTML fragment used by the GUI to refresh the persons / thumbnails view.
+            persons, root_images = get_known_faces_structure(UPLOAD_FOLDER)
+            return render_template('_face_list.html', persons=persons, root_images=root_images)
+
+        @self.app.route('/delete_person/<person>', methods=['POST'])
+        def delete_person(person):
+            person = sanitize_person_name(person)
+            if not person:
+                return jsonify({'error': 'Invalid person name'}), 400
+
+            person_dir = os.path.join(UPLOAD_FOLDER, person)
+            if not os.path.isdir(person_dir):
+                return jsonify({'error': f'Person {person} not found'}), 404
+
+            try:
+                shutil.rmtree(person_dir)
+                # The GUI uses standard form POSTs for deleting a person.
+                # A redirect keeps the UX consistent (full page refresh).
+                return jsonify({'status':'ok'})
+            except Exception as e:
+                return jsonify({'error': f'Error deleting {person}: {str(e)}'}), 500
+
+        @self.app.route('/knownfaces/<path:filename>')
+        def knownfaces(filename):
+            # Serve known face images (supports subfolders per person)
+            try:
+                file_path = safe_path(UPLOAD_FOLDER, filename)
+            except ValueError:
+                return "Invalid path", 400
+            if not os.path.isfile(file_path):
+                return "Not found", 404
+            return send_file(file_path)
+
+        @self.app.route('/delete_image/<path:filename>', methods=['POST'])
         def delete_image(filename):
-            # Der vollständige Pfad zur Datei
-            file_path = os.path.join(UPLOAD_FOLDER, filename)
-
-            # Überprüfung, ob die Datei existiert
-            if os.path.exists(file_path):
-                # Versuchen, die Datei zu löschen
+            # prevent traversal
+            try:
+                file_path = safe_path(UPLOAD_FOLDER, filename)
+            except ValueError:
+                return jsonify({'error': 'Invalid path'}), 400
+            if os.path.exists(file_path) and os.path.isfile(file_path):
                 try:
                     os.remove(file_path)
-                    return redirect(url_for('index'))
+                    return jsonify({'status':'ok'})
                 except Exception as e:
-                    return jsonify({'error': f'Fehler beim Löschen von {filename}: {str(e)}'}), 500
-            else:
-                # Wenn die Datei nicht gefunden wurde
-                return jsonify({'error': f'Bild {filename} nicht gefunden'}), 404
-
-        @self.app.route('/event_log')
-        def show_log():
-            try:
-                log_file = self.config_manager.get('log_file')
-
-                # Öffnen der Datei und Erstellen eines JSON-Arrays
-                with open(log_file, 'r') as file:
-                    entries = [json.loads(line) for line in file if line.strip()]
-                return jsonify(entries)  # Gibt ein valides JSON-Array zurück
-
-            except Exception as e:
-                # Im Fehlerfall geben wir eine Fehlermeldung und den HTTP-Statuscode 500 zurück
-                return jsonify({'error': str(e)}), 500
-
-        @self.app.route('/list-faces')
-        def list_faces():
-            faces = os.listdir(UPLOAD_FOLDER)
-            print(faces)
-
-            return render_template('_face_list.html', faces=faces)
-
-        @self.app.route('/knownfaces/<filename>')
-        def knownfaces(filename):
-            # Simple security measure to prevent path traversal
-            if '..' in filename or filename.startswith('/'):
-                return "Access denied", 403
-
-            BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-            uploadfolder = os.path.join(BASE_DIR, UPLOAD_FOLDER)
-            return send_from_directory(uploadfolder, filename)
+                    return jsonify({'error': f'Error deleting {filename}: {str(e)}'}), 500
+            return jsonify({'error': f'Image {filename} not found'}), 404
 
         @self.app.route('/event-image/<filename>')
         def event_image(filename):
-            # Einfache Sicherheitsmaßnahme zur Verhinderung von Path Traversal
+            # Basic path traversal protection
             if '..' in filename or filename.startswith('/'):
-                return "Access denied", 403
+                return 'Access denied', 403
 
-            # Bestimmung des Basisverzeichnisses
             base_dir = os.path.dirname(os.path.abspath(__file__))
-            # Holen des Pfades aus der Konfiguration
             image_path = os.path.join(base_dir, self.config_manager.get('image_path'))
 
             try:
-                # Sicherstellen, dass der Pfad existiert und ein Verzeichnis ist
                 if not os.path.exists(image_path) or not os.path.isdir(image_path):
-                    raise FileNotFoundError("The specified image directory does not exist.")
-
-                # Senden der Datei aus dem angegebenen Verzeichnis
+                    raise FileNotFoundError('The specified image directory does not exist.')
                 return send_from_directory(image_path, filename)
             except FileNotFoundError as e:
-                # Fehlerbehandlung, falls der Pfad nicht existiert
                 return str(e), 404
 
         @self.app.route('/last-event-image')
         def last_event_image():
-            image_path = self.config_manager.get('image_path')
-            # Alle Dateien im Verzeichnis auflisten
-            files = [os.path.join(image_path, f) for f in os.listdir(image_path)]
-            # Die neueste Datei finden basierend auf der Erstellungszeit
-            latest_file = max(files, key=os.path.getctime)
-            # Die neueste Datei senden
-            return send_file(latest_file, mimetype='image/jpeg')  # Mimetype entsprechend anpassen
+            """Redirect to the most recent event image if available."""
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            image_path = os.path.join(base_dir, self.config_manager.get('image_path'))
+            if not os.path.exists(image_path) or not os.path.isdir(image_path):
+                return 'The specified image directory does not exist.', 404
+            imgs = [f for f in os.listdir(image_path) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+            if not imgs:
+                return 'No event images available.', 404
+            imgs.sort(key=lambda fn: os.path.getmtime(os.path.join(image_path, fn)), reverse=True)
+            return redirect(url_for('event_image', filename=imgs[0]))
 
+
+
+        @self.app.route('/event_log')
+        def event_log():
+            """Return event log entries as JSON list for the Event Log tab (Tabulator)."""
+            log_file = self.config_manager.get('log_file', '/data/event_log.json')
+            entries = []
+            try:
+                if os.path.exists(log_file):
+                    with open(log_file, 'r', encoding='utf-8', errors='replace') as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                entries.append(json.loads(line))
+                            except Exception:
+                                # Ignore malformed lines
+                                continue
+            except Exception as e:
+                logging.exception("Failed to read event log file: %s", e)
+                return jsonify([])
+
+            # Most recent first
+            entries.reverse()
+            resp = jsonify(entries)
+            # Prevent browser/proxy caching so the Event Log updates reliably without hard refresh.
+            resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+            resp.headers['Pragma'] = 'no-cache'
+            resp.headers['Expires'] = '0'
+            return resp
+        @self.app.route('/clean_event_images', methods=['POST'])
+        def clean_event_images():
+            action = (request.form.get('action') or 'clean').strip().lower()
+
+            if action == 'save':
+                days_raw = (request.form.get('eventimage_cleanup_days') or '').strip()
+                try:
+                    days_int = int(days_raw)
+                except Exception:
+                    days_int = 0
+                if days_int < 0:
+                    days_int = 0
+                if days_int > 3650:
+                    days_int = 3650
+                self.config_manager.set('eventimage_cleanup_days', days_int)
+                self.config_manager.save_config()
+                return jsonify({'status': 'ok', 'message': 'Saved.', 'days': days_int})
+
+            # CLEAN uses saved config only (save required)
+            days_int = int(self.config_manager.get('eventimage_cleanup_days', 0) or 0)
+            if days_int <= 0:
+                return jsonify({'status': 'error', 'message': 'Cleanup is disabled (set days > 0 and save first).'}), 400
+
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            image_path = os.path.join(base_dir, self.config_manager.get('image_path'))
+            if not os.path.exists(image_path) or not os.path.isdir(image_path):
+                return jsonify({'status': 'error', 'message': 'The specified image directory does not exist.'}), 404
+
+            cutoff = time.time() - (days_int * 24 * 60 * 60)
+            deleted = 0
+            deleted_files = []
+            errors = 0
+            for fn in os.listdir(image_path):
+                if not fn.lower().endswith(('.jpg', '.jpeg', '.png')):
+                    continue
+                p = os.path.join(image_path, fn)
+                try:
+                    if os.path.isfile(p) and os.path.getmtime(p) < cutoff:
+                        os.remove(p)
+                        deleted += 1
+                        deleted_files.append(fn)
+                except Exception:
+                    errors += 1
+
+            # Prune event_log.json to remove entries whose images were deleted.
+            try:
+                if deleted_files:
+                    log_file = self.config_manager.get('log_file', '/data/event_log.json')
+                    prune_event_log(log_file, image_path, logging)
+            except Exception:
+                logging.exception("Failed to prune event log after cleanup")
+
+            msg = f'Deleted {deleted} image(s).' + (f' ({errors} error(s))' if errors else '')
+            return jsonify({'status': 'ok', 'message': msg, 'deleted': deleted, 'errors': errors, 'days': days_int})
     def run(self):
+        """Run the configuration frontend (port 5000)."""
         self.app.run(
-            host='0.0.0.0',  # interner server jeder Adresse des hosts aus erreichbar
-            port=5000,  # Einstellung für den Port des Konfigurationsservers
+            host='0.0.0.0',
+            port=5000,
             threaded=True,
             use_reloader=False,
-            debug=True
+            debug=True,
         )

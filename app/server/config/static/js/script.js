@@ -2,10 +2,43 @@ const colorPicker = document.getElementById('colorPicker');
 const transparencySlider = document.getElementById('overlayTransparency');
 const colorOverlay = document.getElementById('colorOverlay');
 
-// Format utc to local date and time
-function formatLocalTime(utcDateString) {
-    let utcDate = new Date(utcDateString + 'Z');  // Füge 'Z' hinzu, um als UTC zu kennzeichnen
-    return utcDate.toLocaleString();  // Konvertiert in die lokale Zeit des Browsers
+// Format timestamps for display.
+// The backend currently stores timestamps as *local time strings* (e.g. "2026-01-01 18:00:00").
+// Treat those as local time (do NOT append "Z"), otherwise the browser will shift the time.
+// If the string already contains a timezone ("Z" or +hh:mm), we let the browser parse it normally.
+function formatLocalTime(value) {
+    if (!value) return "";
+
+    // If numeric epoch (seconds or ms)
+    if (typeof value === 'number') {
+        const ms = value < 1e12 ? value * 1000 : value;
+        return new Date(ms).toLocaleString();
+    }
+
+    const s = String(value).trim();
+
+    // ISO strings with timezone info -> parse directly
+    if (/Z$/.test(s) || /[+-]\d\d:?\d\d$/.test(s)) {
+        const d = new Date(s);
+        return isNaN(d.getTime()) ? s : d.toLocaleString();
+    }
+
+    // "YYYY-MM-DD HH:MM:SS" (local time)
+    const m = s.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/);
+    if (m) {
+        const year = parseInt(m[1], 10);
+        const month = parseInt(m[2], 10) - 1;
+        const day = parseInt(m[3], 10);
+        const hour = parseInt(m[4], 10);
+        const minute = parseInt(m[5], 10);
+        const second = parseInt(m[6] || '0', 10);
+        const d = new Date(year, month, day, hour, minute, second);
+        return isNaN(d.getTime()) ? s : d.toLocaleString();
+    }
+
+    // Fallback: try browser parsing
+    const d = new Date(s);
+    return isNaN(d.getTime()) ? s : d.toLocaleString();
 }
 
 
@@ -14,7 +47,7 @@ function openModalAndShowImages(data) {
     var e = document.querySelector('.image-wrapper');
     e.innerHTML = imageBlock;
     var imageModalLabel = document.querySelector('#imageModalLabel')
-    imageModalLabel.innerHTML = `${data.name} - ${data.timestamp}`
+    imageModalLabel.innerHTML = `${data.name} - ${formatLocalTime(data.timestamp)}`
 
     var modalElement = document.getElementById('imageModal');
     var modal = new bootstrap.Modal(modalElement);
@@ -74,12 +107,53 @@ function updateFacesList() {
         .then(response => response.text())  // Die Antwort als Text verarbeiten
         .then(html => {
             // Ersetzen Sie den Inhalt der Gesichterliste mit dem neuen HTML
-            document.querySelector('.known-faces-list').innerHTML = html;
+            document.querySelector('#personsContainer').innerHTML = html;
+            // Re-init dynamic Dropzones after replacing HTML
+            if (typeof window.initPersonDropzones === 'function') {
+                window.initPersonDropzones();
+            }
         })
         .catch(error => {
             console.error('Fehler beim Aktualisieren der Gesichterliste:', error);
         });
 }
+
+// Dynamic Dropzones for each person (must be global, because updateFacesList() is global)
+if (window.Dropzone) {
+    Dropzone.autoDiscover = false;
+}
+
+window.personDropzones = window.personDropzones || [];
+
+window.initPersonDropzones = function initPersonDropzones() {
+    if (!window.Dropzone) return;
+
+    // Destroy existing instances (avoid duplicate bindings after ajax reload)
+    (window.personDropzones || []).forEach(dz => {
+        try { dz.destroy(); } catch (e) {}
+    });
+    window.personDropzones = [];
+
+    document.querySelectorAll('form.person-dropzone').forEach(form => {
+        const person = form.dataset.person || '';
+        const dz = new Dropzone(form, {
+            url: '/upload_faces',
+            acceptedFiles: "image/jpeg,image/png,image/jpg",
+            maxFilesize: 12,
+            dictInvalidFileType: "Ungültiges Dateiformat. Nur JPEG und PNG sind erlaubt."
+        });
+
+        dz.on('sending', function (file, xhr, formData) {
+            formData.append('person', person);
+        });
+
+        dz.on('success', function () {
+            updateFacesList();
+        });
+
+        window.personDropzones.push(dz);
+    });
+};
 
 function updateDelayDisplay(value) {
     const minutes = Math.floor(value / 60);
@@ -98,13 +172,33 @@ function updateFaceRecognitionIntervalValue(value) {
 
 document.addEventListener("DOMContentLoaded", function () {
 
+    // "Open Stream" button (always points to http://<current-host>:5001/stream)
+    const openStreamButton = document.getElementById('openStreamButton');
+    if (openStreamButton) {
+        const host = window.location.hostname;
+        openStreamButton.href = `http://${host}:5001/stream`;
+    }
+
     sendBaseUrlToServer();
-    table.setData('/event_log');
+    function loadEventLog() {
+        // Cache-bust to avoid stale Event Log data without requiring a hard refresh.
+        table.setData(`/event_log?ts=${Date.now()}`);
+    }
+
+    loadEventLog();
     table.on("rowClick", function (e, row) {
         var data = row.getData();
         openModalAndShowImages(data);
     });
 
+
+    // Reload event log whenever the user opens the Eventlog tab.
+    const eventlogTab = document.getElementById('eventlog-tab');
+    if (eventlogTab) {
+        eventlogTab.addEventListener('shown.bs.tab', function () {
+            loadEventLog();
+        });
+    }
 
 //form submit
     document.getElementById('submitFormButton').addEventListener('click', async function (event) {
@@ -168,16 +262,68 @@ document.addEventListener("DOMContentLoaded", function () {
         document.getElementById('transparencyValue').innerText = this.value + '%';
     };
 
-// Dropzone-Konfiguration
-    Dropzone.options.knownFacesDropzone = {
-        acceptedFiles: "image/jpeg,image/png,image/jpg",
-        maxFilesize: 12, // Max. Dateigröße in MB
-        dictInvalidFileType: "Ungültiges Dateiformat. Nur JPEG und PNG sind erlaubt.",
-
-        success: function (file, response) {
-            // Aktualisieren Sie die Liste der Gesichter
-            updateFacesList();
-        }
+    // Init dynamic Dropzones (global helper, used by updateFacesList())
+    if (typeof window.initPersonDropzones === 'function') {
+        window.initPersonDropzones();
     }
-})
-;
+
+    // Create person
+    const createBtn = document.getElementById('createPersonBtn');
+    if (createBtn) {
+        createBtn.addEventListener('click', function () {
+            const input = document.getElementById('newPersonName');
+            const person = (input ? input.value : '').trim();
+            if (!person) return;
+
+            fetch('/create_person', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({person})
+            })
+                .then(res => res.json())
+                .then(() => {
+                    if (input) input.value = '';
+                    updateFacesList();
+                })
+                .catch(err => console.error('Fehler beim Anlegen der Person:', err));
+        });
+    }
+
+    // (Dropzones already initialized above)
+
+
+    // Intercept delete actions (keep current tab, no full page reload)
+    const personsContainer = document.getElementById('personsContainer');
+    if (personsContainer) {
+        personsContainer.addEventListener('submit', async (ev) => {
+            const form = ev.target;
+            if (!(form instanceof HTMLFormElement)) return;
+
+            if (form.classList.contains('js-delete-image')) {
+                ev.preventDefault();
+                try {
+                    const resp = await fetch(form.action, { method: 'POST' });
+                    if (!resp.ok) throw new Error('Delete failed');
+                    await updateFacesList();
+                } catch (e) {
+                    console.error(e);
+                    alert('Failed to delete image.');
+                }
+            }
+
+            if (form.classList.contains('js-delete-person')) {
+                ev.preventDefault();
+                if (!confirm('Delete this person and all images?')) return;
+                try {
+                    const resp = await fetch(form.action, { method: 'POST' });
+                    if (!resp.ok) throw new Error('Delete failed');
+                    await updateFacesList();
+                } catch (e) {
+                    console.error(e);
+                    alert('Failed to delete person.');
+                }
+            }
+        });
+    }
+
+});

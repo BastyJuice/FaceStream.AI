@@ -42,3 +42,83 @@
 .dropzone-container:hover {
   border-color: #0056b3;
 }
+
+
+/* Known Persons UI */
+.person-box{
+  border: 3px solid #3f51ff;
+  border-radius: 28px;
+  padding: 18px 18px 14px 18px;
+  margin-bottom: 22px;
+  background: #fff;
+}
+
+.person-header{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  margin-bottom: 10px;
+}
+
+.person-title{
+  font-weight: 700;
+  font-size: 20px;
+}
+
+.person-del-btn{
+  width: 32px;
+  height: 32px;
+  line-height: 18px;
+  border-radius: 999px;
+  padding: 0;
+  font-weight: 700;
+}
+
+.person-dropzone{
+  border: 2px dashed #a9b2ff;
+  border-radius: 16px;
+  background: #fafbff;
+  padding: 14px;
+  margin-bottom: 12px;
+}
+
+.person-dropzone .dz-message{
+  margin: 0;
+}
+
+.person-thumbs{
+  display:flex;
+  flex-wrap:wrap;
+  gap: 12px;
+}
+
+.face-thumb{
+  position: relative;
+  width: 92px;
+}
+
+.face-thumb-img{
+  width: 92px;
+  height: 92px;
+  object-fit: cover;
+}
+
+.face-thumb-del{
+  position:absolute;
+  right: -6px;
+  bottom: -6px;
+  margin:0;
+}
+
+.face-thumb-del-btn{
+  width: 26px;
+  height: 26px;
+  border-radius: 999px;
+  padding: 0;
+  line-height: 22px;
+  font-weight: 800;
+}
+
+.person-box-root{
+  border-style: dashed;
+}

@@ -3,11 +3,71 @@ import time
 import signal
 import logging
 import os
+import json
 from flask import Flask, Response, stream_with_context
 import cv2
 import queue
+import numpy as np
 
 
+
+def is_manual_trigger_active(config_manager, trigger_file='/data/manual_trigger.json'):
+    """Return True if manual trigger is active (including grace seconds)."""
+    try:
+        if not os.path.exists(trigger_file):
+            return False
+        with open(trigger_file, 'r') as f:
+            data = json.load(f)
+        now = time.time()
+        triggered_at = float(data.get('timestamp', 0.0))
+        duration = float(data.get('duration', 0.0))
+        duration = max(0.0, min(duration, 120.0))
+        grace = 10.0
+        try:
+            grace = float(config_manager.get('stream_suspend_grace_seconds', 10) or 0)
+        except Exception:
+            grace = 10.0
+        grace = max(0.0, min(grace, 600.0))
+        return now <= (triggered_at + duration + grace)
+    except Exception:
+        return False
+
+
+def add_pause_overlay(frame):
+    """Draw a straight 'Suspend' overlay with a lightly blurred background."""
+    overlay = frame.copy()
+
+    # Light background blur (keep text sharp by drawing after blur)
+    try:
+        overlay = cv2.GaussianBlur(overlay, (0, 0), 8)
+    except Exception:
+        # If blur fails for any reason, fall back to unblurred
+        overlay = frame.copy()
+
+    h, w = overlay.shape[:2]
+
+    # Semi-transparent dark band behind the text for readability
+    band_h = max(80, int(h * 0.18))
+    y0 = (h - band_h) // 2
+    y1 = y0 + band_h
+    band = overlay.copy()
+    cv2.rectangle(band, (0, y0), (w, y1), (0, 0, 0), -1)
+    overlay = cv2.addWeighted(band, 0.35, overlay, 0.65, 0)
+
+    text_label = "Suspend"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = max(1.2, w / 900.0)
+    thickness = max(2, int(w / 500))
+
+    (tw, th), _ = cv2.getTextSize(text_label, font, font_scale, thickness)
+    x = (w - tw) // 2
+    y = (h + th) // 2
+
+    # White text with dark outline for contrast (text itself not blurred)
+    cv2.putText(overlay, text_label, (x, y), font, font_scale, (0, 0, 0), thickness + 3, cv2.LINE_AA)
+    cv2.putText(overlay, text_label, (x, y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+    return overlay
 def check_for_restart_signal(signal_file_path, interval=10):
     while True:
         if os.path.exists(signal_file_path):
@@ -55,27 +115,40 @@ class VideoStreamingServer:
 
     def start_stream(self):
         def generate():
-            last_time = time.time()
+            last_frame = None
             while True:
                 try:
-                    frame = self.frame_queue.get(timeout=3)
-                    current_time = time.time()
+                    frame = self.frame_queue.get(timeout=1)
+                    last_frame = frame
+
                     _, jpeg = cv2.imencode('.jpg', frame)
                     frame_data = jpeg.tobytes()
                     yield (b'--frame\r\n'
                            b'Content-Type: image/jpeg\r\n\r\n' + frame_data + b'\r\n')
 
-                    # Zeitdifferenz berechnen und entsprechend warten
-                    elapsed = time.time() - current_time
-                    sleep_time = max(0, (1.0 / 30) - elapsed)  # Sorge für 30 FPS
-                    time.sleep(sleep_time)
-                    last_time = current_time
+                    time.sleep(1.0 / 30)  # target 30 FPS
+
                 except queue.Empty:
-                    logging.debug("Warte auf Frames...")
+                    suspend_enabled = bool(self.config_manager.get('enable_stream_suspend', False))
+                    trigger_active = is_manual_trigger_active(self.config_manager)
+
+                    if suspend_enabled and not trigger_active and last_frame is not None:
+                        paused = add_pause_overlay(last_frame)
+                        _, jpeg = cv2.imencode('.jpg', paused)
+                        frame_data = jpeg.tobytes()
+                        yield (b'--frame\r\n'
+                               b'Content-Type: image/jpeg\r\n\r\n' + frame_data + b'\r\n')
+                        time.sleep(0.2)  # ~5 FPS for pause screen
+                    else:
+                        logging.debug("Warte auf Frames...")
+                        time.sleep(0.1)
+
                 except Exception as e:
                     logging.error(f"Error during frame generation: {e}")
+                    time.sleep(0.1)
 
         return generate()
+
 
     def stop_stream(self):
         logging.info("stream gestoppt")

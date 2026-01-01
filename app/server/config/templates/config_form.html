@@ -88,7 +88,17 @@
 
                         <div class="row mt-3">
                             <div class="col-8">
+                                
                                 <div class="form-check mb-2">
+                                    <input class="form-check-input" type="checkbox" id="enableStreamSuspend"
+                                           name="enable_stream_suspend"
+                                           {% if config.get('enable_stream_suspend', False) %}checked{% endif %}
+                                           onchange="toggleStreamSuspendAvailability()">
+                                    <label class="form-check-label" for="enableStreamSuspend">
+                                        Enable Stream Suspend
+                                    </label>
+                                </div>
+<div class="form-check mb-2">
                                     <input class="form-check-input" type="checkbox" id="enableFaceRecognitionInterval"
                                            name="enable_face_recognition_interval"
                                            {% if config.get('enable_face_recognition_interval', True) %}checked{% endif %}
@@ -109,6 +119,50 @@
                                         id="faceRecognitionIntervalValue">{{ config.face_recognition_interval }}</span></small>
                                 frames
                             </div>
+
+          <hr class="my-4">
+          <h5>Face Recognition Tuning</h5>
+
+          <div class="row">
+            <div class="col-md-4">
+              <label for="face_scale_factor" class="form-label">Detection Scale Factor</label>
+              <input type="number" step="0.05" min="0.25" max="1.0" class="form-control" id="face_scale_factor" name="face_scale_factor" value="{{ config.get('face_scale_factor', 0.75) }}">
+              <div class="form-text">Higher = more accurate, more CPU. Recommended: 0.75–1.0 for 720p.</div>
+            </div>
+
+            <div class="col-md-4">
+              <label for="face_detection_model" class="form-label">Face Detection Model</label>
+              <select class="form-select" id="face_detection_model" name="face_detection_model">
+                <option value="hog" {% if config.get('face_detection_model', 'hog') == 'hog' %}selected{% endif %}>hog (fast)</option>
+                <option value="cnn" {% if config.get('face_detection_model', 'hog') == 'cnn' %}selected{% endif %}>cnn (more accurate, slower)</option>
+              </select>
+            </div>
+
+            <div class="col-md-4">
+              <label for="face_match_threshold" class="form-label">Match Threshold</label>
+              <input type="number" step="0.01" min="0.30" max="0.80" class="form-control" id="face_match_threshold" name="face_match_threshold" value="{{ config.get('face_match_threshold', 0.55) }}">
+              <div class="form-text">Lower = stricter (more Unknown). Typical: 0.50–0.60.</div>
+            </div>
+          </div>
+
+          <div class="row mt-3">
+            <div class="col-md-4 form-check">
+              <input class="form-check-input" type="checkbox" id="enable_clahe" name="enable_clahe" {% if config.get('enable_clahe', False) %}checked{% endif %}>
+              <label class="form-check-label" for="enable_clahe">Enable low-light enhancement (CLAHE)</label>
+            </div>
+
+            <div class="col-md-4 form-check">
+              <input class="form-check-input" type="checkbox" id="enable_blur_filter" name="enable_blur_filter" {% if config.get('enable_blur_filter', False) %}checked{% endif %}>
+              <label class="form-check-label" for="enable_blur_filter">Skip blurry frames</label>
+            </div>
+
+            <div class="col-md-4">
+              <label for="blur_threshold" class="form-label">Blur Threshold</label>
+              <input type="number" step="1" min="0" max="5000" class="form-control" id="blur_threshold" name="blur_threshold" value="{{ config.get('blur_threshold', 100.0) }}">
+              <div class="form-text">Higher = stricter blur filter (skips more frames). Typical: 80–150.</div>
+            </div>
+          </div>
+
                         </div>
                     </section>
                     <!-- Linie als Trenner -->
@@ -118,6 +172,10 @@
                     <!-- rechter Bereich -->
                     <section class="col-md-5">
                         <h3>Overlay Settings</h3>
+                        <div class="form-check form-switch mb-3">
+                            <input class="form-check-input" type="checkbox" id="enableFaceOverlay" name="enable_face_overlay" {% if config.enable_face_overlay %}checked{% endif %}>
+                            <label class="form-check-label" for="enableFaceOverlay">Show face boxes and names</label>
+                        </div>
                         <div class="row">
                             <div class="col">
                                 <div class="image-container">
@@ -165,49 +223,38 @@
         </form>
         <!-- Weitere Formularelemente und Submit-Button ... -->
     </div>
+
     <!-- Bekannte Gesichter Tab -->
     <div class="tab-pane fade" id="known-faces" role="tabpanel" aria-labelledby="known-faces-tab">
-        <!-- Dropzone für den Upload -->
-        <form action="{{ url_for('upload_faces') }}" class="dropzone mt-4 border-primary" id="knownFacesDropzone">
-            <div class="container p-5 dropzone-container">
-
-                <p class="m-1 dz-message">Move face portraits here. Make sure that only one persons face is visible on
-                    the
-                    your portrait.
-                    Use the file name for the name of person on portrait.
-                </p>
-
-            </div>
-        </form>
-
-        <!-- Liste der vorhandenen Gesichter -->
-        <div class="known-faces-list mt-4">
-            <h4>Vorhandene Gesichter</h4>
-            <div class="known-faces-list">
-                <div class="list-group">
-                    {% for face in known_faces %}
-                    <div class="list-group-item list-group-item-action d-flex justify-content-between align-items-center">
-                        <span>{{ face }}</span>  <!-- Text auf der linken Seite -->
-                        <img src="{{ url_for('knownfaces', filename=face) }}" class="img-thumbnail" alt="Gesicht"
-                             width="100px">
-                        <!-- Löschbutton-Formular auf der rechten Seite -->
-                        <form action="{{ url_for('delete_image', filename=face) }}" method="post"
-                              style="margin-bottom: 0;">
-                            <button class="btn btn-small btn-danger">löschen</button>
-                        </form>
-                    </div>
-                    {% endfor %}
+        <div class="mt-4">
+            <div class="row g-2 align-items-end">
+                <div class="col-md-4">
+                    <label for="newPersonName" class="form-label"><strong>New Person</strong></label>
+                    <input type="text" class="form-control" id="newPersonName" placeholder="e.g. Norman">
+                </div>
+                <div class="col-md-2">
+                    <button type="button" class="btn btn-primary w-100" id="createPersonBtn">Create</button>
+                </div>
+                <div class="col-md-6 small text-muted">
+                    Create people and then drag images directly into the matching box. Multiple images per person improve recognition.
                 </div>
             </div>
         </div>
+
+        <!-- People + images (updated via /list-faces) -->
+        <div class="mt-4" id="personsContainer">
+            {% include '_face_list.html' %}
+        </div>
     </div>
+
     <div class="tab-pane fade" id="notification" role="tabpanel" aria-labelledby="notification-tab">
         <form method="post" id="notification-form" class="needs-validation" novalidate>
             <div class="row mt-3">
-                 <p class="alert alert-info">
-                        <b>Note:</b> The messages are sent by the video server. You must use the host name of the video server if it is required for the message-receiving servers.
-                    </p>
-<div class="col-12 mt-4">
+                <p class="alert alert-info">
+                    <b>Note:</b> The messages are sent by the video server. You must use the host name of the video server if it is required for the message-receiving servers.
+                </p>
+
+                <div class="col-12 mt-4">
                     <h3>Loxone Virtual Text Input</h3>
                     <div class="form-check mb-3">
                         <input class="form-check-input" type="checkbox" id="use_loxone_vti" name="use_loxone_vti"
@@ -239,7 +286,7 @@
                                    value="{{config.loxone_text_input}}" placeholder="VTI_Name">
                         </div>
                     </div>
-                    
+
                     <div class="row">
                         <div class="col-12 mb-2">
                             <button type="button" class="btn btn-outline-primary" id="loxone-test-btn">
@@ -296,9 +343,7 @@
                                value="{{config.web_service_url}}">
                     </div>
                 </div>
-                
             </div>
-
 
             <!-- Notification Delay Slider -->
             <div class="row mt-4">
@@ -313,6 +358,7 @@
                         face recognition event. </small>
                 </div>
             </div>
+
             <!-- Custom Message -->
             <div class="row mt-3">
                 <div class="col-6">
@@ -333,40 +379,45 @@
                 </div>
             </div>
         </form>
-
     </div>
 
     <div class="tab-pane fade" id="eventlog" role="tabpanel" aria-labelledby="eventlog-tab">
         <div class="my-3">
             <a href="{{ url_for('last_event_image') }}" target="_blank">Last event image</a>
         </div>
+
         <p class="alert alert-info">
             <b>Note:</b> The notification delay is used for event logging.
         </p>
-        <form method="post" id="eventlog-form" class="needs-validation" novalidate>
-            <div class="alert alert-primary">
-                <b>Clean up Unknown images</b><br>
-                Deletes <code>Unknown_*.jpg</code> images in <code>/event-image/</code> that are older than the configured number of days.<br><br>
-                <div class="row g-3 align-items-center">
-                    <div class="col-auto">
-                        <label for="unknown_cleanup_days" class="col-form-label">Delete Unknown images older than (days)</label>
-                    </div>
-                    <div class="col-auto">
-                        <input type="number" class="form-control" id="unknown_cleanup_days" name="unknown_cleanup_days"
-                               min="0" max="3650" value="{{ config.unknown_cleanup_days if config.unknown_cleanup_days is not none else 0 }}">
-                    </div>
-                    <div class="col-auto">
-                        <small class="form-text text-muted">0 = disabled</small>
-                    </div>
-                </div>
+
+        <!-- IMPORTANT:
+             - No extra Save button here (use global "Save changes").
+             - The input is attached to settings-form via form="settings-form" so it is included when saving. -->
+        <div class="mb-3">
+            <label class="form-label" for="eventimage_cleanup_days">Delete images older than (days)</label>
+
+            <div class="input-group">
+                <input type="number"
+                       class="form-control"
+                       id="eventimage_cleanup_days"
+                       name="eventimage_cleanup_days"
+                       min="0"
+                       max="3650"
+                       form="settings-form"
+                       value="{{ config.get('eventimage_cleanup_days', 0) }}">
+                <button type="button" id="cleanNowBtn" class="btn btn-danger">Clean now</button>
             </div>
-        </form>
+
+            <small class="form-text text-muted">0 = disabled</small>
+            <small class="form-text text-muted">Change the value and click <b>Save changes</b> at the bottom of the page.</small>
+
+            <div id="cleanNowResult" class="small text-muted mt-2"></div>
+        </div>
 
         <div id="eventlog-table"></div>
     </div>
 
 </div>
-
 
 <script>
 function toggleFaceRecognitionInterval() {
@@ -374,45 +425,95 @@ function toggleFaceRecognitionInterval() {
   const slider = document.getElementById('face_recognition_interval');
   if (!cb || !slider) return;
   slider.disabled = !cb.checked;
+
+  // Stream suspend is only allowed if face recognition interval is disabled
+  toggleStreamSuspendAvailability();
 }
 
-// Loxone test button
+function toggleStreamSuspendAvailability() {
+  const intervalCb = document.getElementById('enableFaceRecognitionInterval');
+  const suspendCb = document.getElementById('enableStreamSuspend');
+  if (!intervalCb || !suspendCb) return;
+
+  if (intervalCb.checked) {
+    suspendCb.checked = false;
+    suspendCb.disabled = true;
+  } else {
+    suspendCb.disabled = false;
+  }
+}
+
 document.addEventListener('DOMContentLoaded', function () {
   // Ensure the slider is correctly enabled/disabled on load
   toggleFaceRecognitionInterval();
+  toggleStreamSuspendAvailability();
 
+  // Clean now uses SAVED config only (your NEIN/NEIN requirement)
+  const cleanBtn = document.getElementById('cleanNowBtn');
+  const result = document.getElementById('cleanNowResult');
+
+  if (cleanBtn) {
+    cleanBtn.addEventListener('click', async function () {
+      try {
+        if (result) {
+          result.textContent = 'Cleaning...';
+          result.className = 'small text-muted mt-2';
+        }
+
+        const resp = await fetch('/clean_event_images', { method: 'POST' });
+        const data = await resp.json().catch(() => ({}));
+
+        if (!resp.ok) {
+          const msg = (data && (data.message || data.error)) ? (data.message || data.error) : ('HTTP ' + resp.status);
+          throw new Error(msg);
+        }
+
+        const deleted = (typeof data.deleted !== 'undefined') ? data.deleted : (data.count || 0);
+        if (result) {
+          result.textContent = `Done. Deleted ${deleted} image(s).`;
+          result.className = 'small text-success mt-2';
+        }
+      } catch (e) {
+        if (result) {
+          result.textContent = 'Error: ' + (e && e.message ? e.message : e);
+          result.className = 'small text-danger mt-2';
+        }
+      }
+    });
+  }
+
+  // Loxone test button
   const btn = document.getElementById('loxone-test-btn');
   const out = document.getElementById('loxone-test-result');
-  if (!btn) return;
-
-  btn.addEventListener('click', async function () {
-    if (out) {
-      out.textContent = 'Sending...';
-      out.className = 'ms-2 text-muted';
-    }
-    try {
-      const resp = await fetch('/loxone-test', { method: 'POST' });
-      const data = await resp.json().catch(() => ({}));
-      if (resp.ok && data && data.status === 'ok') {
-        if (out) {
-          out.textContent = 'OK';
-          out.className = 'ms-2 text-success';
+  if (btn) {
+    btn.addEventListener('click', async function () {
+      if (out) {
+        out.textContent = 'Sending...';
+        out.className = 'ms-2 text-muted';
+      }
+      try {
+        const resp = await fetch('/loxone-test', { method: 'POST' });
+        const data = await resp.json().catch(() => ({}));
+        if (resp.ok && data && data.status === 'ok') {
+          if (out) {
+            out.textContent = 'OK';
+            out.className = 'ms-2 text-success';
+          }
+        } else {
+          const msg = (data && data.message) ? data.message : ('HTTP ' + resp.status);
+          if (out) {
+            out.textContent = 'Error: ' + msg;
+            out.className = 'ms-2 text-danger';
+          }
         }
-      } else {
-        const msg = (data && data.message) ? data.message : ('HTTP ' + resp.status);
+      } catch (e) {
         if (out) {
-          out.textContent = 'Error: ' + msg;
+          out.textContent = 'Error: ' + (e && e.message ? e.message : e);
           out.className = 'ms-2 text-danger';
         }
       }
-    } catch (e) {
-      if (out) {
-        out.textContent = 'Error: ' + (e && e.message ? e.message : e);
-        out.className = 'ms-2 text-danger';
-      }
-    }
-  });
+    });
+  }
 });
 </script>
 {% endblock %}
-

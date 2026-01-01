@@ -12,6 +12,7 @@ def initialize_app_structure():
         'overlay_color': [220, 220, 200],
         'overlay_transparency': 0.5,
         'overlay_border': 1,
+        'enable_face_overlay': True,
         'output_width': 640,
         'output_height': 480,
         'notification_delay': 60,  # Zeit in Sekunden
@@ -38,13 +39,20 @@ def initialize_app_structure():
         'loxone_text_input': '',
         'web_service_url': '',
         'udp_service_port': 0,
-        'unknown_cleanup_days': 0,  # days; 0 disables cleanup
-
         'udp_service_url': '',
         # If enabled, Face Recognition runs automatically every N frames.
         # If disabled, Face Recognition runs only via manual /trigger.
+        'enable_stream_suspend': False,
+        'stream_suspend_grace_seconds': 10,
         'enable_face_recognition_interval': True,
         'face_recognition_interval': 60,
+        'face_scale_factor': 0.75,
+        'face_detection_model': 'hog',
+        'face_match_threshold': 0.55,
+        'enable_clahe': False,
+        'enable_blur_filter': False,
+        'blur_threshold': 100.0,
+        'eventimage_cleanup_days': 0,
         'image_path': os.path.join('/data', 'saved_faces'),
         'log_file': os.path.join('/data', 'event_log.json')
     }
@@ -55,25 +63,47 @@ class ConfigManager:
     def __init__(self, filepath):
         self.filepath = filepath
         self.config = {}
+        self._mtime = None
         self.load_config()
 
     def load_config(self):
         if not os.path.exists(self.filepath):
-            raise FileNotFoundError(f"Die Konfigurationsdatei {self.filepath} wurde nicht gefunden.")
+            raise FileNotFoundError(f"Config file {self.filepath} was not found.")
         try:
             with open(self.filepath, 'r') as json_file:
                 self.config = json.load(json_file)
+                try:
+                    self._mtime = os.path.getmtime(self.filepath)
+                except OSError:
+                    self._mtime = None
+                if 'eventimage_cleanup_days' not in self.config:
+                    self.config['eventimage_cleanup_days'] = 0
+                # New options (backwards compatible)
+                if 'enable_stream_suspend' not in self.config:
+                    self.config['enable_stream_suspend'] = False
+                if 'stream_suspend_grace_seconds' not in self.config:
+                    self.config['stream_suspend_grace_seconds'] = 10
         except json.JSONDecodeError as e:
-            raise json.JSONDecodeError(f"Fehler beim Lesen der Konfigurationsdatei {self.filepath}: {e.msg}")
+            raise json.JSONDecodeError(f"Error reading config file {self.filepath}: {e.msg}")
 
     def save_config(self):
         try:
             with open(self.filepath, 'w') as json_file:
                 json.dump(self.config, json_file, indent=4)
         except Exception as e:
-            raise IOError(f"Fehler beim Speichern der Konfigurationsdatei '{self.filepath}': {e}")
+            raise IOError(f"Error saving config file '{self.filepath}': {e}")
+
+    def _reload_if_changed(self):
+        """Reload config from disk if the file changed."""
+        try:
+            mtime = os.path.getmtime(self.filepath)
+        except OSError:
+            return
+        if self._mtime is None or mtime != self._mtime:
+            self.load_config()
 
     def get(self, key, default=None):
+        self._reload_if_changed()
         return self.config.get(key, default)
 
     def set(self, key, value):

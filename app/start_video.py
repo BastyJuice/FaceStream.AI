@@ -24,14 +24,14 @@ def main():
     processed_frame_queue = queue.Queue(maxsize=50)
     output_size = (config_manager.get('output_width'), config_manager.get('output_height'))
     # Starten des Kamera Managers
-    camera_manager = CameraManager(frame_queue, config_manager.get('input_stream_url'), output_size)
+    camera_manager = CameraManager(frame_queue, config_manager.get('input_stream_url'), output_size, config_manager=config_manager)
     camera_manager.start()
 
     # NotificationService
     notification_service = NotificationService(config_manager)
 
     # Laden der bekannten Gesichter
-    face_loader = FaceLoader()
+    face_loader = FaceLoader(config_manager)
 
     # Frame Processor
     frame_processor = FrameProcessor(frame_queue, processed_frame_queue, face_loader, config_manager,

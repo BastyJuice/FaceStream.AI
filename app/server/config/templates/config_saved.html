@@ -1,12 +1,12 @@
 {% extends "layout.html" %}
 
 {% block content %}
-<h1>Konfiguration gespeichert!</h1>
-<p> Sie werden in Kürze zur Startseite umgeleitet...</p>
+<h1>Configuration saved!</h1>
+<p> You will be redirected to the homepage shortly...</p>
 
 <div class="alert alert-warning alert-dismissible fade show" role="alert">
-    <strong>Hinweis:</strong> Änderungen wurden gespeichert. Der Streaming-Server wird neu gestartet.
-    <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Schließen"></button>
+    <strong>Note:</strong> Changes were saved. The streaming server is restarting.
+    <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
 </div>
 
 
@@ -18,7 +18,7 @@
 
 
     setTimeout(function () {
-        window.location.href = '/'; // JavaScript-basierte Umleitung
+        window.location.href = '/'; // JavaScript-based redirect
     }, 20000); // 10000 Millisekunden = 20 Sekunden
 
     });

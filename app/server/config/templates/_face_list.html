@@ -1,13 +1,48 @@
-<div class="list-group">
-    {% for face in faces %}
-    <div class="list-group-item list-group-item-action">
-        <img src="{{ url_for('knownfaces', filename=face) }}" class="img-thumbnail" width="200" alt="Gesicht">
-        {{ face }}
+{% macro thumb(image_path) -%}
+<div class="face-thumb">
+    <img src="{{ url_for('knownfaces', filename=image_path) }}" class="img-thumbnail face-thumb-img" alt="Face">
+    <form action="{{ url_for('delete_image', filename=image_path) }}" method="post" class="face-thumb-del js-delete-image">
+        <button type="submit" class="btn btn-danger btn-sm face-thumb-del-btn" title="Delete image">×</button>
+    </form>
+</div>
+{%- endmacro %}
 
-        <!-- Löschbutton-Formular -->
-        <form action="{{ url_for('delete_image', filename=face) }}" method="post" style="display: inline;">
-            <button type="submit" class="btn btn-danger btn-sm">Löschen</button>
+{% if persons|length == 0 and (root_images is not defined or root_images|length == 0) %}
+<div class="alert alert-info">No people created yet. Create a person above and drag images into the box.</div>
+{% endif %}
+
+{% for person, images in persons.items() %}
+<div class="person-box">
+    <div class="person-header">
+        <div class="person-title">{{ person }}</div>
+        <form action="{{ url_for('delete_person', person=person) }}" method="post" class="person-del-form js-delete-person">
+            <button type="submit" class="btn btn-danger btn-sm person-del-btn" title="Delete person">×</button>
         </form>
     </div>
-    {% endfor %}
+
+    <form action="{{ url_for('upload_faces') }}" class="dropzone person-dropzone" data-person="{{ person }}">
+        <div class="dz-message person-dropzone-msg">
+            Drag images here – upload starts automatically
+        </div>
+    </form>
+
+    <div class="person-thumbs">
+        {% for image_path in images %}
+            {{ thumb(image_path) }}
+        {% endfor %}
+    </div>
 </div>
+{% endfor %}
+
+{% if root_images is defined and root_images|length > 0 %}
+<div class="person-box person-box-root">
+    <div class="person-header">
+        <div class="person-title">(Unsorted)</div>
+    </div>
+    <div class="person-thumbs">
+        {% for fn in root_images %}
+            {{ thumb(fn) }}
+        {% endfor %}
+    </div>
+</div>
+{% endif %}
