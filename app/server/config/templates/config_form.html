@@ -163,6 +163,14 @@
             </div>
           </div>
 
+          <div class="row mt-3">
+            <div class="col-md-4">
+              <label for="face_upsample_times" class="form-label">Upsample Times</label>
+              <input type="number" step="1" min="0" max="3" class="form-control" id="face_upsample_times" name="face_upsample_times" value="{{ config.get('face_upsample_times', 1) }}">
+              <div class="form-text">Helps detect smaller faces. 0 = off, 1–2 = common, 3 = heavy (CPU).</div>
+            </div>
+          </div>
+
                         </div>
                     </section>
                     <!-- Linie als Trenner -->

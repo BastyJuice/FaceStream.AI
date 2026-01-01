@@ -47,6 +47,9 @@ def initialize_app_structure():
         'enable_face_recognition_interval': True,
         'face_recognition_interval': 60,
         'face_scale_factor': 0.75,
+        # Upsample factor for face detection; helps detect smaller faces.
+        # 0 = none, 1–2 = common, 3 = heavy (CPU expensive)
+        'face_upsample_times': 1,
         'face_detection_model': 'hog',
         'face_match_threshold': 0.55,
         'enable_clahe': False,
@@ -83,6 +86,8 @@ class ConfigManager:
                     self.config['enable_stream_suspend'] = False
                 if 'stream_suspend_grace_seconds' not in self.config:
                     self.config['stream_suspend_grace_seconds'] = 10
+                if 'face_upsample_times' not in self.config:
+                    self.config['face_upsample_times'] = 1
         except json.JSONDecodeError as e:
             raise json.JSONDecodeError(f"Error reading config file {self.filepath}: {e.msg}")
 

@@ -264,6 +264,7 @@ class ConfigFrontend:
                     'face_recognition_interval': validate_int(request.form.get('face_recognition_interval'), 60, 2,
                                                               max_value=300),
                     'face_scale_factor': validate_float(request.form.get('face_scale_factor'), 0.75, 0.25, 1.0),
+                    'face_upsample_times': validate_int(request.form.get('face_upsample_times'), 1, 0, max_value=3),
                     'face_detection_model': (request.form.get('face_detection_model') or 'hog').strip().lower(),
                     'face_match_threshold': validate_float(request.form.get('face_match_threshold'), 0.55, 0.30, 0.80),
                     'enable_clahe': validate_bool(request.form.get('enable_clahe'), False),

@@ -192,7 +192,19 @@ class FrameProcessor(threading.Thread):
             model = str(self.config_manager.get('face_detection_model', 'hog')).lower().strip()
             if model not in ('hog', 'cnn'):
                 model = 'hog'
-            face_locations = face_recognition.face_locations(rgb_small_frame, model=model)
+            # Upsampling helps detect smaller faces (at the cost of CPU).
+            # 0 = no upsample, 1–2 = common, 3 = heavy.
+            try:
+                upsample = int(self.config_manager.get('face_upsample_times', 1))
+            except Exception:
+                upsample = 1
+            upsample = max(0, min(upsample, 3))
+
+            face_locations = face_recognition.face_locations(
+                rgb_small_frame,
+                number_of_times_to_upsample=upsample,
+                model=model
+            )
             face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
             
             # Create a copy of the original frame to draw on
