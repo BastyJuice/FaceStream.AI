@@ -35,6 +35,7 @@ class FrameProcessor(threading.Thread):
         self._trigger_recognition_until = 0.0
         self._trigger_start_unknown_sent = False
         self._trigger_final_event_sent = False
+        self._last_trigger_active_flag = False
         self._trigger_saw_face = False
 
         # Fast config snapshot for the realtime loop (avoid filesystem stat() in hot path).
@@ -176,6 +177,17 @@ class FrameProcessor(threading.Thread):
                     self._refresh_cfg_if_needed()
                     now = time.time()
                     trigger_active = now <= self._trigger_active_until
+                    
+                    # Trigger-Ende erkennen (ON -> OFF) und Cleanup laufen lassen
+                    if (not trigger_active) and self._last_trigger_active_flag:
+                        try:
+                            if hasattr(self.notification_service, 'cleanup_now'):
+                                self.notification_service.cleanup_now()
+                        except Exception as e:
+                            logging.warning(f"Post-trigger cleanup failed: {e}")
+
+                    # Status für nächsten Loop merken
+                    self._last_trigger_active_flag = trigger_active
 
                     # On manual trigger start: send a *silent* Unknown to Loxone only (no event log),
                     # so Loxone doesn't keep an old name displayed.

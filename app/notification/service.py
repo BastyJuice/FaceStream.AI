@@ -7,6 +7,7 @@ import cv2
 import csv
 import json
 from urllib.parse import quote
+from typing import Optional
 
 
 def ensure_directory(path):
@@ -68,6 +69,37 @@ class NotificationService:
                     ensure_directory(log_dir)
         except Exception:
             pass
+
+    def cleanup_now(self, keep_days: Optional[int] = None):
+        """
+        Manuelles Cleanup, z.B. nach Trigger-Ende.
+        Löscht Event-Bilder älter als X Tage und pruned danach event_log.json.
+        """
+        try:
+            days = keep_days
+            if days is None:
+                days = int(self.config_manager.get('eventimage_cleanup_days', 0) or 0)
+
+            if not days or days <= 0:
+                logging.info("cleanup_now: eventimage_cleanup_days is 0 -> nothing to do.")
+                return {"status": "noop", "deleted": 0, "days": days}
+
+            image_path = self.image_path
+            log_file = self.log_file or self.config_manager.get('log_file', '/data/event_log.json')
+
+            deleted_files = cleanup_event_images(image_path, days, logging)
+            if deleted_files:
+                try:
+                    prune_event_log(log_file, image_path, logging)
+                except Exception as e:
+                    logging.warning(f"cleanup_now: prune_event_log failed: {e}")
+
+            logging.info(f"cleanup_now: deleted {len(deleted_files)} file(s) (days={days}).")
+            return {"status": "ok", "deleted": len(deleted_files), "days": days}
+
+        except Exception as e:
+            logging.warning(f"cleanup_now failed: {e}")
+            return {"status": "error", "message": str(e)}
 
     def format_custom_message(self, message_template, log_entry):
         # Abrufen der Konfiguration für die benutzerdefinierte Nachricht

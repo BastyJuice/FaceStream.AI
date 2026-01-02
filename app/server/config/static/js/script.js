@@ -191,12 +191,21 @@ function updateFaceRecognitionIntervalValue(value) {
 
 document.addEventListener("DOMContentLoaded", function () {
 
-    // "Open Stream" button (always points to http://<current-host>:5001/stream)
-    const openStreamButton = document.getElementById('openStreamButton');
-    if (openStreamButton) {
-        const host = window.location.hostname;
-        openStreamButton.href = `http://${host}:5001/stream`;
-    }
+	// "Open Stream" button (stream port = gui port + 1)
+	const openStreamButton = document.getElementById('openStreamButton');
+	if (openStreamButton) {
+		const protocol = window.location.protocol;
+		const host = window.location.hostname;
+
+		// aktueller GUI-Port (Fallback 80/443)
+		const guiPort = window.location.port
+			? parseInt(window.location.port, 10)
+			: (protocol === "https:" ? 443 : 80);
+
+		const streamPort = guiPort + 1;
+
+		openStreamButton.href = `${protocol}//${host}:${streamPort}/stream`;
+	}
 
     sendBaseUrlToServer();
     function loadEventLog() {
