@@ -147,7 +147,26 @@ window.initPersonDropzones = function initPersonDropzones() {
             formData.append('person', person);
         });
 
-        dz.on('success', function () {
+        dz.on('success', function (file) {
+            try { this.removeFile(file); } catch (e) {}
+            updateFacesList();
+        });
+
+        dz.on('error', function (file, message, xhr) {
+            // If backend returns JSON {error: ...}, show that.
+            try {
+                if (xhr && xhr.responseText) {
+                    const data = JSON.parse(xhr.responseText);
+                    if (data && data.error) message = data.error;
+                }
+            } catch (e) { /* ignore */ }
+
+            // Remove the preview immediately so user can upload again without refresh
+            try { this.removeFile(file); } catch (e) {}
+
+            alert(message);
+
+            // Refresh list to ensure nothing "sticks" in the UI
             updateFacesList();
         });
 
@@ -301,6 +320,7 @@ document.addEventListener("DOMContentLoaded", function () {
 
             if (form.classList.contains('js-delete-image')) {
                 ev.preventDefault();
+                if (!confirm('Delete this image?')) return;
                 try {
                     const resp = await fetch(form.action, { method: 'POST' });
                     if (!resp.ok) throw new Error('Delete failed');

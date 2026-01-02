@@ -32,10 +32,15 @@ class FrameProcessor(threading.Thread):
         self._trigger_fps = 0.0
         self._trigger_stop_on_match = False
         self._trigger_force_notify_pending = False
+        self._trigger_recognition_until = 0.0
+        self._trigger_start_unknown_sent = False
+        self._trigger_final_event_sent = False
+        self._trigger_saw_face = False
 
 
+    
     def _refresh_trigger(self):
-        """Reload trigger file if changed and update trigger window state."""
+        """Reload manual trigger file if changed and update trigger window state."""
         try:
             if not os.path.exists(self.trigger_file):
                 return
@@ -44,29 +49,59 @@ class FrameProcessor(threading.Thread):
                 return
             self._trigger_mtime = mtime
 
-            with open(self.trigger_file, 'r') as f:
-                data = json.load(f) if f.readable() else {}
+            with open(self.trigger_file, 'r', encoding='utf-8', errors='replace') as f:
+                data = json.load(f) or {}
 
             now = time.time()
             triggered_at = float(data.get('timestamp', now))
             duration = float(data.get('duration', 5))
             fps = float(data.get('fps', 3))
-            stop_on_match = bool(int(data.get('stop_on_match', 0))) if isinstance(data.get('stop_on_match', 0), str) else bool(data.get('stop_on_match', False))
+
+            som = data.get('stop_on_match', 0)
+            if isinstance(som, str):
+                stop_on_match = som.strip().lower() in ('1', 'true', 'yes', 'on')
+            else:
+                stop_on_match = bool(som)
+
             force_notify = data.get('force_notify', True)
-            # Clamp values to safe ranges
+
+            # Clamp
             duration = max(0.5, min(duration, 120.0))
             fps = max(0.1, min(fps, 10.0))
 
-            grace = float(getattr(self.config_manager, 'get', lambda k, d=None: d)('stream_suspend_grace_seconds', 10) or 0)
+            # Grace is used by streaming/overlay logic; recognition/fallback uses duration only
+            grace = float(self.config_manager.get('stream_suspend_grace_seconds', 10) or 0)
+
             self._trigger_active_until = triggered_at + duration + max(0.0, grace)
+            self._trigger_recognition_until = triggered_at + duration
             self._trigger_fps = fps
             self._trigger_next_allowed = 0.0  # allow immediately
             self._trigger_stop_on_match = stop_on_match
             self._trigger_force_notify_pending = bool(force_notify)
-            logging.info(f"Manual trigger activated: duration={duration}s fps={fps} stop_on_match={stop_on_match} force_notify={force_notify}")
+
+            # Reset per-trigger state
+            self._trigger_start_unknown_sent = False
+            self._trigger_final_event_sent = False
+            self._trigger_saw_face = False
+
+            logging.info(
+                f"Manual trigger activated: duration={duration}s fps={fps} stop_on_match={stop_on_match} force_notify={force_notify}"
+            )
         except Exception as e:
             logging.error(f"Failed to refresh manual trigger: {e}")
+
     
+    
+    def _stop_trigger_systemwide(self):
+        """Stop the manual trigger for all components by clearing state and removing the trigger file."""
+        self._trigger_active_until = 0.0
+        self._trigger_recognition_until = 0.0
+        try:
+            if os.path.exists(self.trigger_file):
+                os.remove(self.trigger_file)
+        except Exception as e:
+            logging.warning(f"Failed to remove trigger file: {e}")
+
     def _apply_clahe(self, frame_bgr):
         """Optional contrast enhancement for low-light scenes."""
         try:
@@ -110,14 +145,37 @@ class FrameProcessor(threading.Thread):
                     self._refresh_trigger()
                     now = time.time()
                     trigger_active = now <= self._trigger_active_until
+
+                    # On manual trigger start: send a *silent* Unknown to Loxone only (no event log),
+                    # so Loxone doesn't keep an old name displayed.
+                    if trigger_active and (not self._trigger_start_unknown_sent):
+                        try:
+                            # Loxone-only send (no event log)
+                            if hasattr(self.notification_service, 'send_loxone_name_only'):
+                                self.notification_service.send_loxone_name_only('Unknown')
+                        except Exception:
+                            pass
+                        self._trigger_start_unknown_sent = True
+
+                    # If recognition duration elapsed and we still haven't sent a final event:
+                    # send exactly one Unknown *only if we saw at least one face during the trigger*.
+                    if trigger_active and (now >= self._trigger_recognition_until) and (not self._trigger_final_event_sent):
+                        if self._trigger_saw_face:
+                            try:
+                                self.notification_service.notify('Unknown', frame, force=True)
+                            except Exception as e:
+                                logging.exception(f"Notification failed for Unknown: {e}")
+                            self._trigger_final_event_sent = True
+                        self._stop_trigger_systemwide()
+                        trigger_active = False
                     trigger_allow = trigger_active and (now >= self._trigger_next_allowed)
 
                     if trigger_allow:
                         # Throttle recognition during trigger window
                         self._trigger_next_allowed = now + (1.0 / self._trigger_fps)
-                        processed_frame = self.process_frame(frame)
+                        processed_frame = self.process_frame(frame, trigger_active=True)
                     elif self.enable_face_recognition_interval and (self.frame_count % self.face_recognition_interval == 0):
-                        processed_frame = self.process_frame(frame)
+                        processed_frame = self.process_frame(frame, trigger_active=False)
                     else:
                         # Always update trackers between detections
                         processed_frame = self.update_trackers(frame)
@@ -156,7 +214,7 @@ class FrameProcessor(threading.Thread):
     def stop(self):
         self.running = False
 
-    def process_frame(self, frame):
+    def process_frame(self, frame, trigger_active: bool = False):
         start_time = time.time()
         try:
             scale_factor = float(self.config_manager.get('face_scale_factor', 0.75))
@@ -205,6 +263,8 @@ class FrameProcessor(threading.Thread):
                 number_of_times_to_upsample=upsample,
                 model=model
             )
+            if trigger_active and face_locations:
+                self._trigger_saw_face = True
             face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
             
             # Create a copy of the original frame to draw on
@@ -241,19 +301,28 @@ class FrameProcessor(threading.Thread):
             # Trigger-aware notification: allow one forced notification per manual trigger
             now = time.time()
             trigger_active = now <= self._trigger_active_until
-            force = False
-            if trigger_active and self._trigger_force_notify_pending:
-                force = True
-                self._trigger_force_notify_pending = False
-            try:
-                self.notification_service.notify(name, marked_frame, force=force)
-            except Exception as e:
-                logging.exception(f"Notification failed for {name}: {e}")
-
-            # Optionally stop trigger window on first known match
-            if trigger_active and self._trigger_stop_on_match and name != 'Unknown':
-                self._trigger_active_until = 0.0
-
+            
+            if trigger_active:
+                # During a manual trigger we log exactly ONE event:
+                # - known name immediately on first match (and optionally stop_on_match)
+                # - otherwise Unknown once at trigger end (handled above)
+                if (name != 'Unknown') and (not self._trigger_final_event_sent):
+                    force = True
+                    if self._trigger_force_notify_pending:
+                        self._trigger_force_notify_pending = False
+                    try:
+                        self.notification_service.notify(name, marked_frame, force=force)
+                    except Exception as e:
+                        logging.exception(f"Notification failed for {name}: {e}")
+                    self._trigger_final_event_sent = True
+                    if self._trigger_stop_on_match:
+                        self._stop_trigger_systemwide()
+            else:
+                force = False
+                try:
+                    self.notification_service.notify(name, marked_frame, force=force)
+                except Exception as e:
+                    logging.exception(f"Notification failed for {name}: {e}")
 
             processing_time = time.time() - start_time
             logging.debug(f"Frame processed in {processing_time:.2f} seconds")

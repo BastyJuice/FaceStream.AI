@@ -138,7 +138,7 @@ class VideoStreamingServer:
                         frame_data = jpeg.tobytes()
                         yield (b'--frame\r\n'
                                b'Content-Type: image/jpeg\r\n\r\n' + frame_data + b'\r\n')
-                        time.sleep(0.2)  # ~5 FPS for pause screen
+                        time.sleep(1.0)  # 1 FPS reicht als "Suspend"-Bild völlig
                     else:
                         logging.debug("Warte auf Frames...")
                         time.sleep(0.1)

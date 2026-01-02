@@ -1,6 +1,7 @@
 import os
 import shutil
 from pathlib import Path
+from typing import Tuple
 from flask import Flask, render_template, request, redirect, url_for, jsonify, send_from_directory, send_file
 from werkzeug.utils import secure_filename
 import re
@@ -10,6 +11,9 @@ import json
 import time
 import requests
 from flask import send_file
+from datetime import datetime
+import unicodedata
+import tempfile
 
 # Keep event log consistent when images are deleted via the GUI cleanup action.
 from notification.service import prune_event_log
@@ -39,9 +43,97 @@ def sanitize_person_name(name: str) -> str:
     name = re.sub(r"\s+", " ", name).strip()
     return name
 
+def normalize_person_name(name: str) -> str:
+    """
+    For filenames only:
+    - lowercase
+    - spaces -> _
+    - umlauts/accents removed
+    - keep only [a-z0-9_]
+    """
+    if not name:
+        return ""
+    name = unicodedata.normalize("NFKD", name)
+    name = name.encode("ascii", "ignore").decode("ascii")
+    name = name.lower().strip()
+    name = re.sub(r"\s+", "_", name)
+    name = re.sub(r"[^a-z0-9_]", "", name)
+    return name
+
+def current_timestamp_str() -> str:
+    # DDMMYY-HHMMSS (e.g. 020126-121400)
+    return datetime.now().strftime("%d%m%y-%H%M%S")
+
+
+def create_optimized_face_image(
+    input_path: str,
+    output_dir: str,
+    base_name: str,
+    out_size: int = 512,
+    jpg_quality: int = 90,
+    pad: float = 0.35,
+) -> Tuple[str, str]:
+    """Create a standardized face crop + encoding for best recognition quality.
+
+    - Detects largest face (HOG)
+    - Crops with padding
+    - Resizes to out_size x out_size
+    - Saves as JPEG <base_name>_opt.jpg
+    - Computes encoding from the standardized crop and saves as <base_name>_opt.npy (float32, shape (128,))
+
+    NOTE: Heavy deps are imported lazily to keep the config frontend lightweight.
+    Returns: (opt_jpg_path, opt_npy_path)
+    """
+    # Lazy imports: keep config-frontend RAM low
+    import numpy as np
+    from PIL import Image
+    import face_recognition
+
+    img = face_recognition.load_image_file(input_path)  # RGB
+    h, w = img.shape[:2]
+
+    locations = face_recognition.face_locations(img, model="hog")
+    if not locations:
+        raise ValueError("No face found")
+
+    # Pick largest face
+    areas = [(b - t) * (r - l) for (t, r, b, l) in locations]
+    t, r, b, l = locations[int(np.argmax(areas))]
+
+    # Pad crop
+    bw, bh = (r - l), (b - t)
+    px, py = int(bw * pad), int(bh * pad)
+    l2 = max(0, l - px)
+    r2 = min(w, r + px)
+    t2 = max(0, t - py)
+    b2 = min(h, b + py)
+
+    crop = img[t2:b2, l2:r2]
+    pil = Image.fromarray(crop).resize((out_size, out_size), Image.BILINEAR)
+
+    os.makedirs(output_dir, exist_ok=True)
+    opt_jpg_path = os.path.join(output_dir, f"{base_name}_opt.jpg")
+    pil.save(opt_jpg_path, "JPEG", quality=jpg_quality, optimize=True)
+
+    # Compute encoding from standardized crop (consistent across uploads)
+    crop_rgb = np.array(pil)  # RGB
+    encs = face_recognition.face_encodings(crop_rgb, num_jitters=1, model="small")
+    if not encs:
+        raise ValueError("Face found, but encoding failed")
+    enc = np.asarray(encs[0], dtype=np.float32)
+
+    opt_npy_path = os.path.join(output_dir, f"{base_name}_opt.npy")
+    np.save(opt_npy_path, enc)
+
+    return opt_jpg_path, opt_npy_path
+
+
 
 def get_known_faces_structure(base_dir: str):
-    """Return dict: {person_name: [relative_paths...]}, plus root images under key '__root__'."""
+    """Return dict: {person_name: [relative_paths...]}, plus root images under key '__root__'.
+
+    UI rule: show ONLY optimized reference images (*_opt.jpg). Non-optimized originals stay hidden.
+    """
     persons = {}
     root_images = []
     if not os.path.isdir(base_dir):
@@ -51,17 +143,11 @@ def get_known_faces_structure(base_dir: str):
         p = os.path.join(base_dir, entry)
         if os.path.isdir(p):
             person = entry
-            imgs = []
-            for fn in sorted(os.listdir(p)):
-                if fn.lower().endswith(('.jpg', '.jpeg', '.png')):
-                    imgs.append(f"{person}/{fn}")
-            if imgs:
-                persons[person] = imgs
-            else:
-                # still show empty persons in UI
-                persons.setdefault(person, [])
+            opt_files = [fn for fn in sorted(os.listdir(p)) if fn.lower().endswith('_opt.jpg')]
+            imgs = [f"{person}/{fn}" for fn in opt_files]
+            persons.setdefault(person, imgs)
         else:
-            if entry.lower().endswith(('.jpg', '.jpeg', '.png')):
+            if entry.lower().endswith('_opt.jpg'):
                 root_images.append(entry)
 
     return persons, root_images
@@ -178,7 +264,7 @@ class ConfigFrontend:
 
             # Clamp
             duration = max(0.5, min(duration, 120.0))
-            fps = max(0.1, min(fps, 10.0))
+            fps = max(0.1, min(fps, 300.0))
 
             payload = {
                 'timestamp': time.time(),
@@ -316,17 +402,61 @@ class ConfigFrontend:
             person = sanitize_person_name(person_raw)
 
             if file and allowed_file(file.filename):
-                filename = secure_filename(file.filename)
+                # keep original extension
+                orig_filename = secure_filename(file.filename)
+                _, ext = os.path.splitext(orig_filename)
+                ext = ext.lower()
 
+                # Build path: folder stays exactly as provided (case-sensitive),
+                # only the uploaded file NAME is normalized + timestamped.
                 if person:
                     person_dir = os.path.join(UPLOAD_FOLDER, person)
                     os.makedirs(person_dir, exist_ok=True)
-                    save_path = os.path.join(person_dir, filename)
-                else:
-                    save_path = os.path.join(UPLOAD_FOLDER, filename)
 
-                file.save(save_path)
-                return jsonify({'message': f'File {filename} uploaded successfully'}), 200
+                    person_norm = normalize_person_name(person)
+                    timestamp = current_timestamp_str()
+                    filename = f"{person_norm}_{timestamp}{ext}"
+
+                    # Save upload to a real temporary file (NOT inside person_dir), so failed uploads never show up in the UI.
+                    fd, tmp_path = tempfile.mkstemp(prefix="faces_upload_", suffix=ext)
+                    os.close(fd)
+                    file.save(tmp_path)
+
+                    try:
+                        base_name = os.path.splitext(filename)[0]
+                        optimized_jpg, optimized_npy = create_optimized_face_image(
+                            input_path=tmp_path,
+                            output_dir=person_dir,
+                            base_name=base_name,
+                            out_size=512,
+                            jpg_quality=90,
+                        )
+                        # Delete original upload after successful optimization (user request)
+                        try:
+                            os.remove(tmp_path)
+                        except Exception as _e:
+                            logging.warning(f"Could not delete temporary upload {tmp_path}: {_e}")
+
+                        return jsonify({
+                            'message': f'File {filename} uploaded and processed successfully',
+                            'optimized': optimized_jpg,
+                            'encoding': optimized_npy
+                        }), 200
+
+                    except Exception as e:
+                        # Not suitable -> remove temp and reject upload
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
+                        logging.warning(f"Upload rejected (not suitable) {orig_filename}: {e}")
+                        return jsonify({'error': 'This photo is not suitable for facial recognition.'}), 400
+
+                else:
+                    # Legacy fallback: store as-is under root
+                    save_path = os.path.join(UPLOAD_FOLDER, orig_filename)
+                    file.save(save_path)
+                    return jsonify({'message': f'File {orig_filename} uploaded successfully'}), 200
 
             return jsonify({'error': 'Invalid file type'}), 400
 
@@ -385,13 +515,38 @@ class ConfigFrontend:
                 file_path = safe_path(UPLOAD_FOLDER, filename)
             except ValueError:
                 return jsonify({'error': 'Invalid path'}), 400
-            if os.path.exists(file_path) and os.path.isfile(file_path):
-                try:
-                    os.remove(file_path)
-                    return jsonify({'status':'ok'})
-                except Exception as e:
-                    return jsonify({'error': f'Error deleting {filename}: {str(e)}'}), 500
-            return jsonify({'error': f'Image {filename} not found'}), 404
+
+            if not (os.path.exists(file_path) and os.path.isfile(file_path)):
+                return jsonify({'error': f'Image {filename} not found'}), 404
+
+            deleted = []
+            errors = []
+
+            def _try_delete(p):
+                if p and os.path.exists(p) and os.path.isfile(p):
+                    try:
+                        os.remove(p)
+                        deleted.append(p)
+                        return True
+                    except Exception as e:
+                        errors.append(f"{p}: {e}")
+                return False
+
+            _try_delete(file_path)
+
+            base, ext = os.path.splitext(file_path)
+            ext_l = ext.lower()
+
+            if ext_l in ('.jpg', '.jpeg', '.png'):
+                _try_delete(base + '.npy')
+            elif ext_l == '.npy':
+                _try_delete(base + '.jpg')
+                _try_delete(base + '.jpeg')
+                _try_delete(base + '.png')
+
+            if errors:
+                return jsonify({'error': 'Some files could not be deleted', 'deleted': deleted, 'errors': errors}), 500
+            return jsonify({'status': 'ok', 'deleted': deleted})
 
         @self.app.route('/event-image/<filename>')
         def event_image(filename):

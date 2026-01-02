@@ -59,8 +59,8 @@ class CameraManager(threading.Thread):
                 logging.info("Camera connected successfully.")
                 return
             else:
-                logging.warning(f"Kann Kamera nicht öffnen, Versuch {attempt + 1}/{self.max_retries}")
                 attempt += 1
+                logging.warning(f"Verbindungsversuch {attempt} fehlgeschlagen. Neuer Versuch in 2 Sekunden...")
                 try:
                     self.capture.release()
                 except Exception:
@@ -84,15 +84,41 @@ class CameraManager(threading.Thread):
         while self.running:
             try:
                 if self._stream_suspend_enabled() and not self._trigger_active():
-                    # Suspend: close camera to save CPU/network
-                    self._close_camera()
-                    time.sleep(0.2)
+                    # Suspend: keep connection warm to avoid slow resume (no full reconnect)
+                    try:
+                        if self.capture is None or not self.capture.isOpened():
+                            self.open_camera()
+                    except Exception as e:
+                        logging.error(f"Camera open failed (suspend warmup): {e}")
+                        self._close_camera()
+                        time.sleep(0.5)
+                        continue
+
+                    try:
+                        ok = self.capture.grab()  # minimal overhead, no decode
+                    except Exception:
+                        ok = False
+
+                    if not ok:
+                        logging.warning("Grab failed during suspend; reconnecting...")
+                        self._close_camera()
+                        time.sleep(0.5)
+                    else:
+                        # ~1 FPS keep-alive (very low network/CPU)
+                        time.sleep(0.8)
                     continue
 
                 # Ensure camera is open
                 if self.capture is None or not self.capture.isOpened():
                     try:
                         self.open_camera()
+                        # Flush a few frames after (re)open to reduce latency/backlog
+                        try:
+                            for _ in range(10):
+                                if self.capture:
+                                    self.capture.grab()
+                        except Exception:
+                            pass
                     except Exception as e:
                         logging.error(f"Camera open failed: {e}")
                         self._close_camera()

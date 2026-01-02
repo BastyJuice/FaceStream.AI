@@ -199,6 +199,13 @@ class NotificationService:
                 logging.error(f"Loxone notification failed (HTTP {resp.status_code}): {url}")
         except Exception as e:
             logging.error(f"Failed to send Loxone request: {e} (URL={url})")
+    def send_loxone_name_only(self, name: str) -> None:
+        """Send a value to Loxone VTI WITHOUT creating an event log entry."""
+        try:
+            self.send_loxone_notification({'name': str(name or 'Unknown')})
+        except Exception as e:
+            logging.warning(f"Loxone VTI send failed: {e}")
+
 
     def save_image(self, frame, name, timestamp):
         filename = f"{name}_{int(timestamp)}.jpg"
