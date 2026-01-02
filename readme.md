@@ -1,3 +1,29 @@
+## Introduction
+
+This project is a fork of the original  
+**FaceStream.AI** by Norman Albusberger  
+https://github.com/norman-albusberger/FaceStream.AI
+
+The script has been extended and adapted to better fit real-world automation scenarios, with a strong focus on **Loxone smart home integration** and controlled face recognition behavior.
+
+### Key Changes and Enhancements
+
+- Added a **manual face recognition trigger (`/trigger`)** to start detection on demand.
+- Introduced **trigger-only operation**, allowing face recognition to run exclusively via manual triggers without automatic intervals.
+- Implemented **CPU-friendly trigger windows** with configurable duration, FPS limits, and optional `stop_on_match`.
+- Added **forced notifications for manual triggers**, ensuring one notification is always sent when a known person is detected.
+- Integrated **Loxone Virtual Text Input support** using HTTP GET requests.
+- Added a **GUI-configurable Loxone notification setup**, including a test button.
+- Improved **notification handling and rate limiting** to prevent duplicate or excessive events.
+- Added **automatic cleanup of unknown face images** after a configurable retention period.
+- Enhanced the configuration GUI with additional notes, toggles, and usability improvements.
+
+These changes make FaceStream.AI easier to integrate into **Loxone-based automation systems**, while maintaining backward compatibility with the original project.
+
+If this project helps you, you can give me a cup of coffee
+
+[![Donate](https://img.shields.io/badge/Donate-PayPal-green.svg)](https://paypal.me/bastyjuice)
+
 <p align="center"><em>Face Recognition in Live Video</em></p>
 <h1 align="center">FaceStream.AI</h1>
 
