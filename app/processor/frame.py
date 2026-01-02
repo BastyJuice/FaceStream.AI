@@ -98,7 +98,7 @@ class FrameProcessor(threading.Thread):
 
             # Clamp
             duration = max(0.5, min(duration, 120.0))
-            fps = max(0.1, min(fps, 10.0))
+            fps = max(0.1, min(fps, 20.0))
 
             # Grace is used by streaming/overlay logic; recognition/fallback uses duration only
             grace = float(self.config_manager.get('stream_suspend_grace_seconds', 10) or 0)
