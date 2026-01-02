@@ -15,9 +15,12 @@ class CameraManager(threading.Thread):
         self.frame_queue = frame_queue
         self.capture = None
         self.running = True
-        self.max_retries = max_retries  # Maximale Anzahl von Verbindungsversuchen
+        self.max_retries = max_retries
         self.config_manager = config_manager
         self.trigger_file = os.path.join('/data', 'manual_trigger.json')
+
+        # Trigger-Übergang erkennen (OFF -> ON)
+        self._last_trigger_active = False
 
     def _stream_suspend_enabled(self) -> bool:
         try:
@@ -26,36 +29,46 @@ class CameraManager(threading.Thread):
             return False
 
     def _trigger_active(self) -> bool:
-        """Return True if manual trigger is active (including grace seconds)."""
         try:
             if not os.path.exists(self.trigger_file):
                 return False
             with open(self.trigger_file, 'r') as f:
                 data = json.load(f)
+
             now = time.time()
             triggered_at = float(data.get('timestamp', 0.0))
             duration = float(data.get('duration', 0.0))
             duration = max(0.0, min(duration, 120.0))
+
             grace = 10.0
             if self.config_manager:
                 try:
                     grace = float(self.config_manager.get('stream_suspend_grace_seconds', 10) or 0)
                 except Exception:
                     grace = 10.0
+
             grace = max(0.0, min(grace, 600.0))
             return now <= (triggered_at + duration + grace)
+
         except Exception as e:
             logging.debug(f"Trigger read failed: {e}")
             return False
 
     def open_camera(self):
-        if not self.camera_url:  # Überprüfe, ob die Kamera-URL leer ist
+        if not self.camera_url:
             logging.error("Keine Kamera-URL angegeben.")
             raise ValueError("Keine Kamera-URL angegeben")
+
         attempt = 0
         while attempt < self.max_retries and not self.capture:
             self.capture = cv2.VideoCapture(self.camera_url)
             if self.capture.isOpened():
+                try:
+                    # Buffer klein halten → weniger Latenz (wirkt nicht bei allen Backends, schadet aber nicht)
+                    self.capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                except Exception:
+                    pass
+
                 logging.info("Camera connected successfully.")
                 return
             else:
@@ -66,10 +79,10 @@ class CameraManager(threading.Thread):
                 except Exception:
                     pass
                 self.capture = None
-                time.sleep(2)  # Wartezeit zwischen den Versuchen
-        if not self.capture:
-            logging.error("Kamera konnte nach mehreren Versuchen nicht geöffnet werden.")
-            raise ValueError("Kamera konnte nicht geöffnet werden")
+                time.sleep(2)
+
+        logging.error("Kamera konnte nach mehreren Versuchen nicht geöffnet werden.")
+        raise ValueError("Kamera konnte nicht geöffnet werden")
 
     def _close_camera(self):
         if self.capture is not None:
@@ -80,11 +93,14 @@ class CameraManager(threading.Thread):
         self.capture = None
 
     def run(self):
-        # Don't open camera immediately if suspend mode is enabled
         while self.running:
             try:
-                if self._stream_suspend_enabled() and not self._trigger_active():
-                    # Suspend: keep connection warm to avoid slow resume (no full reconnect)
+                # Trigger pro Loop nur einmal lesen (Datei-IO reduziert)
+                trigger_now = self._trigger_active()
+                suspend_enabled = self._stream_suspend_enabled()
+
+                # Suspend-Mode: Verbindung warm halten, ABER Backlog verhindern (Drain)
+                if suspend_enabled and not trigger_now:
                     try:
                         if self.capture is None or not self.capture.isOpened():
                             self.open_camera()
@@ -92,6 +108,7 @@ class CameraManager(threading.Thread):
                         logging.error(f"Camera open failed (suspend warmup): {e}")
                         self._close_camera()
                         time.sleep(0.5)
+                        self._last_trigger_active = trigger_now
                         continue
 
                     try:
@@ -104,46 +121,73 @@ class CameraManager(threading.Thread):
                         self._close_camera()
                         time.sleep(0.5)
                     else:
-                        # ~1 FPS keep-alive (very low network/CPU)
-                        time.sleep(0.8)
+                        # WICHTIG: Drain statt 1 FPS keep-alive (sonst Backlog bei 20 FPS Quelle)
+                        time.sleep(0.05)  # 20 Hz; alternativ 0.1 für weniger Load
+
+                    self._last_trigger_active = trigger_now
                     continue
 
-                # Ensure camera is open
+                # Kamera sicherstellen
                 if self.capture is None or not self.capture.isOpened():
                     try:
                         self.open_camera()
-                        # Flush a few frames after (re)open to reduce latency/backlog
+                        # Nach Reconnect alte Frames verwerfen
                         try:
                             for _ in range(10):
-                                if self.capture:
-                                    self.capture.grab()
+                                self.capture.grab()
                         except Exception:
                             pass
                     except Exception as e:
                         logging.error(f"Camera open failed: {e}")
                         self._close_camera()
                         time.sleep(2)
+                        self._last_trigger_active = trigger_now
                         continue
 
-                ret, frame = self.capture.read()
-                if not ret:
-                    logging.warning("Kein Frame von Kamera erhalten, versuche reconnect...")
+                # Trigger-Übergang (OFF -> ON): einmalig kurz flushen, um sofort live zu sein
+                if trigger_now and not self._last_trigger_active:
+                    t_end = time.monotonic() + 0.4  # 0.3–0.6s bewährt
+                    try:
+                        while time.monotonic() < t_end:
+                            if not self.capture.grab():
+                                break
+                    except Exception:
+                        pass
+
+                # IMMER NEUESTES FRAME HOLEN (Frame-Drop aktiv)
+                try:
+                    for _ in range(2):  # 2–3 ideal bei MJPEG @ ~20 FPS
+                        self.capture.grab()
+                except Exception:
+                    logging.warning("Grab fehlgeschlagen, versuche reconnect...")
                     self._close_camera()
                     time.sleep(0.5)
+                    self._last_trigger_active = trigger_now
+                    continue
+
+                ret, frame = self.capture.retrieve()
+                if not ret or frame is None:
+                    logging.warning("Kein Frame von Kamera erhalten (retrieve), versuche reconnect...")
+                    self._close_camera()
+                    time.sleep(0.5)
+                    self._last_trigger_active = trigger_now
                     continue
 
                 resized_frame = cv2.resize(frame, self.output_size)
+
+                # Queue: immer nur neuestes Frame behalten
                 while True:
                     try:
                         self.frame_queue.put(resized_frame, timeout=0.05)
-                        break  # Frame erfolgreich hinzugefügt, Schleife verlassen
+                        break
                     except queue.Full:
                         try:
-                            # Versuche, den ältesten Frame zu entfernen, um Platz zu schaffen
                             self.frame_queue.get_nowait()
-                            logging.info("Frame queue ist voll. Ältester Frame wurde verworfen.")
+                            logging.debug("Frame queue voll – ältestes Frame verworfen.")
                         except queue.Empty:
-                            logging.error("Versuch, aus leerer Queue zu lesen obwohl sie voll sein sollte.")
+                            pass
+
+                self._last_trigger_active = trigger_now
 
             except Exception as e:
                 logging.error(f"Error in CameraManager loop: {e}")

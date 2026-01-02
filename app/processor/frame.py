@@ -37,6 +37,36 @@ class FrameProcessor(threading.Thread):
         self._trigger_final_event_sent = False
         self._trigger_saw_face = False
 
+        # Fast config snapshot for the realtime loop (avoid filesystem stat() in hot path).
+        self._cfg = {}
+        self._cfg_refresh_interval = 1.0  # seconds
+        self._cfg_next_refresh = 0.0
+
+        # Prime snapshot once so we don't have to wait for the first interval.
+        try:
+            self._cfg = self.config_manager.get_snapshot()
+        except Exception:
+            self._cfg = {}
+
+
+    def _refresh_cfg_if_needed(self):
+        """Refresh cached config snapshot at most every _cfg_refresh_interval seconds."""
+        now = time.monotonic()
+        if now < self._cfg_next_refresh:
+            return
+        try:
+            cfg = self.config_manager.get_snapshot()
+        except Exception:
+            cfg = self._cfg or {}
+        self._cfg = cfg
+        self._cfg_next_refresh = now + self._cfg_refresh_interval
+
+        # Keep frequently used fields in sync (still cheap because this runs ~1x/sec)
+        self.overlay_transparency = cfg.get('overlay_transparency', self.overlay_transparency)
+        self.overlay_color = cfg.get('overlay_color', self.overlay_color)
+        self.enable_face_recognition_interval = cfg.get('enable_face_recognition_interval', self.enable_face_recognition_interval)
+        self.face_recognition_interval = cfg.get('face_recognition_interval', self.face_recognition_interval)
+
 
     
     def _refresh_trigger(self):
@@ -143,6 +173,7 @@ class FrameProcessor(threading.Thread):
                 frame = self.frame_queue.get(timeout=0.5)
                 if frame is not None:
                     self._refresh_trigger()
+                    self._refresh_cfg_if_needed()
                     now = time.time()
                     trigger_active = now <= self._trigger_active_until
 
@@ -217,7 +248,10 @@ class FrameProcessor(threading.Thread):
     def process_frame(self, frame, trigger_active: bool = False):
         start_time = time.time()
         try:
-            scale_factor = float(self.config_manager.get('face_scale_factor', 0.75))
+            self._refresh_cfg_if_needed()
+            cfg = self._cfg or {}
+
+            scale_factor = float(cfg.get('face_scale_factor', 0.75))
             # Clamp to reasonable range
             if scale_factor < 0.25:
                 scale_factor = 0.25
@@ -226,9 +260,9 @@ class FrameProcessor(threading.Thread):
             small_frame = cv2.resize(frame, (0, 0), fx=scale_factor, fy=scale_factor)
 
             # Optional blur filter: skip recognition on very blurry frames
-            if self.config_manager.get('enable_blur_filter', False):
+            if cfg.get('enable_blur_filter', False):
                 try:
-                    blur_threshold = float(self.config_manager.get('blur_threshold', 100.0))
+                    blur_threshold = float(cfg.get('blur_threshold', 100.0))
                 except Exception:
                     blur_threshold = 100.0
                 score = self._blur_score(small_frame)
@@ -237,7 +271,7 @@ class FrameProcessor(threading.Thread):
                     return frame
 
             # Optional low-light enhancement
-            if self.config_manager.get('enable_clahe', False):
+            if cfg.get('enable_clahe', False):
                 small_frame = self._apply_clahe(small_frame)
 
             # Convert small frame to RGB from BGR, which OpenCV uses
@@ -247,13 +281,13 @@ class FrameProcessor(threading.Thread):
             self.trackers = []
             
             # Detect faces
-            model = str(self.config_manager.get('face_detection_model', 'hog')).lower().strip()
+            model = str(cfg.get('face_detection_model', 'hog')).lower().strip()
             if model not in ('hog', 'cnn'):
                 model = 'hog'
             # Upsampling helps detect smaller faces (at the cost of CPU).
             # 0 = no upsample, 1–2 = common, 3 = heavy.
             try:
-                upsample = int(self.config_manager.get('face_upsample_times', 1))
+                upsample = int(cfg.get('face_upsample_times', 1))
             except Exception:
                 upsample = 1
             upsample = max(0, min(upsample, 3))
@@ -296,7 +330,7 @@ class FrameProcessor(threading.Thread):
                 tracker.init(frame, bbox)
                 self.trackers.append({'tracker': tracker, 'name': name})
             # Draw rectangles and notify
-            if self.config_manager.get('enable_face_overlay', True):
+            if cfg.get('enable_face_overlay', True):
                 marked_frame = self.draw_rectangle_with_name(marked_frame, top, right, bottom, left, name)
             # Trigger-aware notification: allow one forced notification per manual trigger
             now = time.time()
@@ -330,6 +364,8 @@ class FrameProcessor(threading.Thread):
         return marked_frame
 
     def update_trackers(self, frame):
+        self._refresh_cfg_if_needed()
+        cfg = self._cfg or {}
         new_trackers = []
         updated_frame = frame.copy()  # Erstelle eine Kopie für Updates
         for tracked in self.trackers:
@@ -340,7 +376,7 @@ class FrameProcessor(threading.Thread):
                 left, top, width, height = [int(v) for v in box]
                 right, bottom = left + width, top + height
                 # Respect overlay toggle for tracker-only updates as well
-                if self.config_manager.get('enable_face_overlay', True):
+                if cfg.get('enable_face_overlay', True):
                     try:
                         updated_frame = self.draw_rectangle_with_name(updated_frame, top, right, bottom, left, name)
                     except Exception as e:
@@ -352,25 +388,77 @@ class FrameProcessor(threading.Thread):
         return updated_frame
 
     def draw_rectangle_with_name(self, frame, top, right, bottom, left, name):
+        """Draw a semi-transparent filled face box + name label.
+
+        Performance note:
+        We blend only the region-of-interest (ROI) of the face box instead of the full frame.
+        This avoids a full-frame copy + addWeighted() on every face and reduces CPU significantly.
+        """
         try:
-            border_color = (255, 255, 255)  # Weiß
-            border_thickness = 1  # Stärke der weißen Border
-            rectangle_thickness = -1  # Füllt das Rechteck
-            transparency = self.overlay_transparency
-            overlay_color = self.overlay_color[::-1]
-            overlay = frame.copy()
-            cv2.rectangle(overlay, (left, top), (right, bottom), overlay_color, rectangle_thickness)
-            # Hier wird die Schriftgröße angepasst
-            font_scale = 1.0  # Erhöhe diesen Wert, um die Schriftgröße zu vergrößern
-            font_thickness = 2  # die Schriftstärke anpassen, falls nötig
-            cv2.rectangle(frame, (left - border_thickness, top - border_thickness),
-                          (right + border_thickness, bottom + border_thickness), border_color, border_thickness)
-            blended_frame = cv2.addWeighted(overlay, 1 - transparency, frame, transparency, 0)
-            cv2.putText(blended_frame, name, (left, bottom + border_thickness + 25), cv2.FONT_HERSHEY_SIMPLEX,
-                        font_scale, (255, 255, 255),
-                        font_thickness)
+            h, w = frame.shape[:2]
+
+            # Clamp coordinates to frame bounds
+            left_i = max(0, min(int(left), w - 1))
+            right_i = max(0, min(int(right), w))
+            top_i = max(0, min(int(top), h - 1))
+            bottom_i = max(0, min(int(bottom), h))
+
+            if right_i <= left_i or bottom_i <= top_i:
+                return frame
+
+            border_color = (255, 255, 255)  # white
+            border_thickness = 1
+            transparency = float(self.overlay_transparency)
+            if transparency < 0.0:
+                transparency = 0.0
+            if transparency > 1.0:
+                transparency = 1.0
+
+            # Convert overlay color from RGB (config) to BGR (OpenCV)
+            overlay_color = tuple(int(c) for c in self.overlay_color[::-1])
+
+            # Draw border (outline) directly (cheap)
+            cv2.rectangle(
+                frame,
+                (max(0, left_i - border_thickness), max(0, top_i - border_thickness)),
+                (min(w - 1, right_i + border_thickness), min(h - 1, bottom_i + border_thickness)),
+                border_color,
+                border_thickness,
+            )
+
+            # ROI-only alpha blend for filled rectangle
+            roi = frame[top_i:bottom_i, left_i:right_i]
+            if roi.size == 0:
+                return frame
+
+            # Make a solid overlay for the ROI
+            overlay = roi.copy()
+            overlay[:, :] = overlay_color
+
+            # Keep legacy semantics: transparency=0 => fully colored overlay; transparency=1 => original
+            cv2.addWeighted(overlay, 1.0 - transparency, roi, transparency, 0.0, roi)
+
+            # Text
+            font_scale = 1.0
+            font_thickness = 2
+
+            # Prefer below the box, but if it would go out of bounds, place above.
+            text_y = bottom_i + border_thickness + 25
+            if text_y > h - 5:
+                text_y = max(15, top_i - 10)
+
+            cv2.putText(
+                frame,
+                str(name),
+                (left_i, text_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                (255, 255, 255),
+                font_thickness,
+            )
         except Exception as e:
             # Never raise from overlay rendering; return the original frame unchanged.
-            logging.debug(f"Failed to draw rectangle with name: {e}")
+            logging.debug(f"Failed to draw rectangle with name (ROI overlay): {e}")
             return frame
-        return blended_frame
+
+        return frame

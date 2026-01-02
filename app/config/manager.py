@@ -1,5 +1,6 @@
 import json
 import os
+import time
 
 data_folder = '/data'
 known_faces_folder = os.path.join(data_folder, 'knownfaces')
@@ -67,6 +68,10 @@ class ConfigManager:
         self.filepath = filepath
         self.config = {}
         self._mtime = None
+        # Throttle reload checks to avoid filesystem syscalls in hot paths.
+        # Live reload stays functional, but we won't stat() the config file on every get().
+        self.reload_interval = 1.0  # seconds
+        self._last_check_ts = 0.0
         self.load_config()
 
     def load_config(self):
@@ -99,7 +104,13 @@ class ConfigManager:
             raise IOError(f"Error saving config file '{self.filepath}': {e}")
 
     def _reload_if_changed(self):
-        """Reload config from disk if the file changed."""
+        """Reload config from disk if the file changed (throttled)."""
+        now = time.monotonic()
+        # Only check mtime every reload_interval seconds
+        if (now - self._last_check_ts) < self.reload_interval:
+            return
+        self._last_check_ts = now
+
         try:
             mtime = os.path.getmtime(self.filepath)
         except OSError:
@@ -110,6 +121,12 @@ class ConfigManager:
     def get(self, key, default=None):
         self._reload_if_changed()
         return self.config.get(key, default)
+
+    def get_snapshot(self):
+        """Return a stable (shallow) copy of the current config after a throttled reload check."""
+        self._reload_if_changed()
+        # Shallow copy is enough because we mostly store primitives/lists.
+        return dict(self.config)
 
     def set(self, key, value):
         self.config[key] = value
