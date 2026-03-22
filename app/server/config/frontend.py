@@ -10,7 +10,6 @@ import logging
 import json
 import time
 import requests
-from flask import send_file
 from datetime import datetime
 import unicodedata
 import tempfile
@@ -27,21 +26,20 @@ def safe_path(base_dir: str, relative_path: str) -> str:
     base = Path(base_dir).resolve()
     rel = (relative_path or "").lstrip("/").replace("\\", "/")
     candidate = (base / rel).resolve()
-    # Ensure candidate is within base
     if base == candidate or str(candidate).startswith(str(base) + os.sep):
         return str(candidate)
     raise ValueError("Invalid path")
+
 
 def sanitize_person_name(name: str) -> str:
     """Turn user input into a safe folder name while keeping it readable."""
     if name is None:
         return ""
     name = name.strip().strip('"').strip("'").strip()
-    # Replace path separators and other problematic chars
     name = re.sub(r"[\\/\x00-\x1f:<>\|\?\*]+", "_", name)
-    # Collapse whitespace
     name = re.sub(r"\s+", " ", name).strip()
     return name
+
 
 def normalize_person_name(name: str) -> str:
     """
@@ -60,8 +58,8 @@ def normalize_person_name(name: str) -> str:
     name = re.sub(r"[^a-z0-9_]", "", name)
     return name
 
+
 def current_timestamp_str() -> str:
-    # DDMMYY-HHMMSS (e.g. 020126-121400)
     return datetime.now().strftime("%d%m%y-%H%M%S")
 
 
@@ -73,34 +71,21 @@ def create_optimized_face_image(
     jpg_quality: int = 90,
     pad: float = 0.35,
 ) -> Tuple[str, str]:
-    """Create a standardized face crop + encoding for best recognition quality.
-
-    - Detects largest face (HOG)
-    - Crops with padding
-    - Resizes to out_size x out_size
-    - Saves as JPEG <base_name>_opt.jpg
-    - Computes encoding from the standardized crop and saves as <base_name>_opt.npy (float32, shape (128,))
-
-    NOTE: Heavy deps are imported lazily to keep the config frontend lightweight.
-    Returns: (opt_jpg_path, opt_npy_path)
-    """
-    # Lazy imports: keep config-frontend RAM low
+    """Create a standardized face crop + encoding for best recognition quality."""
     import numpy as np
     from PIL import Image
     import face_recognition
 
-    img = face_recognition.load_image_file(input_path)  # RGB
+    img = face_recognition.load_image_file(input_path)
     h, w = img.shape[:2]
 
     locations = face_recognition.face_locations(img, model="hog")
     if not locations:
         raise ValueError("No face found")
 
-    # Pick largest face
     areas = [(b - t) * (r - l) for (t, r, b, l) in locations]
     t, r, b, l = locations[int(np.argmax(areas))]
 
-    # Pad crop
     bw, bh = (r - l), (b - t)
     px, py = int(bw * pad), int(bh * pad)
     l2 = max(0, l - px)
@@ -115,8 +100,7 @@ def create_optimized_face_image(
     opt_jpg_path = os.path.join(output_dir, f"{base_name}_opt.jpg")
     pil.save(opt_jpg_path, "JPEG", quality=jpg_quality, optimize=True)
 
-    # Compute encoding from standardized crop (consistent across uploads)
-    crop_rgb = np.array(pil)  # RGB
+    crop_rgb = np.array(pil)
     encs = face_recognition.face_encodings(crop_rgb, num_jitters=1, model="small")
     if not encs:
         raise ValueError("Face found, but encoding failed")
@@ -128,12 +112,8 @@ def create_optimized_face_image(
     return opt_jpg_path, opt_npy_path
 
 
-
 def get_known_faces_structure(base_dir: str):
-    """Return dict: {person_name: [relative_paths...]}, plus root images under key '__root__'.
-
-    UI rule: show ONLY optimized reference images (*_opt.jpg). Non-optimized originals stay hidden.
-    """
+    """Return dict: {person_name: [relative_paths...]}, plus root images under key '__root__'."""
     persons = {}
     root_images = []
     if not os.path.isdir(base_dir):
@@ -153,10 +133,8 @@ def get_known_faces_structure(base_dir: str):
     return persons, root_images
 
 
-
 def allowed_file(filename):
-    return '.' in filename and \
-        filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
 def validate_int(value, default, min_value=None, max_value=None):
@@ -179,21 +157,18 @@ def validate_bool(value, default):
         return default
 
 
-# Funktion zur Validierung von Hex-Farben
 def validate_hex_color(value, default):
     if value and re.match(r'^#(?:[0-9a-fA-F]{3}){1,2}$', value):
         return value
-    else:
-        return default
+    return default
 
 
-# Funktion zur Validierung von URLs
 def validate_url(value, default):
     try:
         result = urlparse(value)
         if all([result.scheme, result.netloc]):
             return value
-    except:
+    except Exception:
         pass
     return default
 
@@ -203,8 +178,7 @@ def validate_port(value, default=''):
         port = int(value)
         if 1 <= port <= 65535:
             return port
-        else:
-            raise ValueError("Port number out of range")
+        raise ValueError("Port number out of range")
     except (ValueError, TypeError):
         logging.error(f"Invalid port number provided: {value}, reverting to default: {default}")
         return default
@@ -232,7 +206,6 @@ class ConfigFrontend:
         def set_base_url():
             data = request.get_json()
             base_url = data['baseUrl']
-            # Setzen der Basis-URL im Konfigurationsmanager
             self.config_manager.set('base_url', base_url)
             self.config_manager.save_config()
             return jsonify({'status': 'URL set successfully', 'baseUrl': base_url})
@@ -241,28 +214,37 @@ class ConfigFrontend:
         def test_path():
             try:
                 files_list = os.listdir(UPLOAD_FOLDER)
-                return jsonify({'files': files_list,
-                                'uploadfolder': UPLOAD_FOLDER
-                                }), 200
+                return jsonify({
+                    'files': files_list,
+                    'uploadfolder': UPLOAD_FOLDER
+                }), 200
             except Exception as e:
                 return jsonify({'error': str(e)}), 500
 
-        
         @self.app.route('/trigger', methods=['GET', 'POST'])
         def manual_trigger():
-            # Defaults
-            try:
-                duration = float(request.args.get('duration', 5))
-            except ValueError:
-                duration = 5.0
-            try:
-                fps = float(request.args.get('fps', 3))
-            except ValueError:
-                fps = 3.0
-            stop_on_match = request.args.get('stop_on_match', '0')
-            stop_on_match = True if str(stop_on_match) in ('1', 'true', 'True', 'yes', 'on') else False
+            def _get_param(name, default):
+                if name in request.args:
+                    return request.args.get(name, default)
+                if name in request.form:
+                    return request.form.get(name, default)
 
-            # Clamp
+                data = request.get_json(silent=True) or {}
+                return data.get(name, default)
+
+            try:
+                duration = float(_get_param('duration', 5))
+            except (ValueError, TypeError):
+                duration = 5.0
+
+            try:
+                fps = float(_get_param('fps', 3))
+            except (ValueError, TypeError):
+                fps = 3.0
+
+            stop_on_match_raw = _get_param('stop_on_match', '0')
+            stop_on_match = str(stop_on_match_raw).strip().lower() in ('1', 'true', 'yes', 'on')
+
             duration = max(0.5, min(duration, 120.0))
             fps = max(0.1, min(fps, 300.0))
 
@@ -271,24 +253,55 @@ class ConfigFrontend:
                 'duration': duration,
                 'fps': fps,
                 'stop_on_match': stop_on_match,
-                # Force exactly one notification for a known face during this trigger window
                 'force_notify': True
             }
 
             trigger_file = os.path.join('/data', 'manual_trigger.json')
+            tmp_file = None
+
             try:
-                with open(trigger_file, 'w') as f:
+                os.makedirs('/data', exist_ok=True)
+
+                fd, tmp_file = tempfile.mkstemp(
+                    prefix='manual_trigger_',
+                    suffix='.json',
+                    dir='/data'
+                )
+
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
                     json.dump(payload, f)
-                return jsonify({'status': 'ok', 'trigger': payload})
+                    f.flush()
+                    os.fsync(f.fileno())
+
+                os.replace(tmp_file, trigger_file)
+
+                response = self.app.response_class(
+                    response='OK',
+                    status=200,
+                    mimetype='text/plain'
+                )
+                response.headers['Cache-Control'] = 'no-store'
+                return response
+
             except Exception as e:
                 logging.error(f"Failed to write trigger file {trigger_file}: {e}")
-                return jsonify({'status': 'error', 'message': str(e)}), 500
+                response = self.app.response_class(
+                    response=f"ERROR: {e}",
+                    status=500,
+                    mimetype='text/plain'
+                )
+                response.headers['Cache-Control'] = 'no-store'
+                return response
 
-        
+            finally:
+                if tmp_file and os.path.exists(tmp_file):
+                    try:
+                        os.remove(tmp_file)
+                    except Exception:
+                        pass
 
         @self.app.route('/loxone-test', methods=['POST'])
         def loxone_test():
-            # Test button: send a fixed name to Loxone Virtual Text Input
             if not self.config_manager.get('use_loxone_vti'):
                 return jsonify({'status': 'error', 'message': 'Loxone Virtual Text Input is disabled'}), 400
 
@@ -306,11 +319,12 @@ class ConfigFrontend:
 
             try:
                 r = requests.get(url, timeout=5)
-                if r.status_code >= 200 and r.status_code < 300:
+                if 200 <= r.status_code < 300:
                     return jsonify({'status': 'ok', 'url': url}), 200
                 return jsonify({'status': 'error', 'message': f'Loxone responded with HTTP {r.status_code}', 'url': url}), 502
             except Exception as e:
                 return jsonify({'status': 'error', 'message': str(e), 'url': url}), 502
+
         @self.app.route('/', methods=['GET', 'POST'])
         def index():
             print(self.config_manager.config)
@@ -318,6 +332,7 @@ class ConfigFrontend:
             rgba_overlay = self.config_manager.get_rgba_overlay()
             transparency_value = int(round((self.config_manager.get('overlay_transparency')) * 100))
             persons, root_images = get_known_faces_structure(UPLOAD_FOLDER)
+
             if request.method == 'POST':
                 new_config = {
                     'input_stream_url': validate_url(request.form.get('input_stream_url'), ''),
@@ -327,13 +342,10 @@ class ConfigFrontend:
                     'enable_face_overlay': validate_bool(request.form.get('enable_face_overlay'), True),
                     'output_width': validate_int(request.form.get('output_width'), 640, 100, 4000),
                     'output_height': validate_int(request.form.get('output_height'), 480, 100, 4000),
-                    'custom_message_udp': request.form.get('custom_message_udp',
-                                                           '[[name]], spotted at [[time]] on [[date]]!').strip(),
-                    'custom_message_http': request.form.get('custom_message_http',
-                                                            '[[name]], spotted at [[time]] on [[date]]!').strip(),
+                    'custom_message_udp': request.form.get('custom_message_udp', '[[name]], spotted at [[time]] on [[date]]!').strip(),
+                    'custom_message_http': request.form.get('custom_message_http', '[[name]], spotted at [[time]] on [[date]]!').strip(),
                     'use_udp': validate_bool(request.form.get('use_udp'), False),
-                    'use_web': validate_bool(
-                        request.form.get('use_web'), False),
+                    'use_web': validate_bool(request.form.get('use_web'), False),
                     'use_loxone_vti': validate_bool(request.form.get('use_loxone_vti'), False),
                     'loxone_ip': request.form.get('loxone_ip', '').strip(),
                     'loxone_user': request.form.get('loxone_user', '').strip(),
@@ -344,11 +356,8 @@ class ConfigFrontend:
                     'udp_service_port': validate_port(request.form.get('udp_service_port')),
                     'notification_delay': validate_int(request.form.get('notification_delay'), 60, 10, max_value=300),
                     'enable_stream_suspend': validate_bool(request.form.get('enable_stream_suspend'), False),
-                    'enable_face_recognition_interval': validate_bool(
-                        request.form.get('enable_face_recognition_interval'), False
-                    ),
-                    'face_recognition_interval': validate_int(request.form.get('face_recognition_interval'), 60, 2,
-                                                              max_value=300),
+                    'enable_face_recognition_interval': validate_bool(request.form.get('enable_face_recognition_interval'), False),
+                    'face_recognition_interval': validate_int(request.form.get('face_recognition_interval'), 60, 2, max_value=300),
                     'face_scale_factor': validate_float(request.form.get('face_scale_factor'), 0.75, 0.25, 1.0),
                     'face_upsample_times': validate_int(request.form.get('face_upsample_times'), 1, 0, max_value=3),
                     'face_detection_model': (request.form.get('face_detection_model') or 'hog').strip().lower(),
@@ -356,40 +365,42 @@ class ConfigFrontend:
                     'enable_clahe': validate_bool(request.form.get('enable_clahe'), False),
                     'enable_blur_filter': validate_bool(request.form.get('enable_blur_filter'), False),
                     'blur_threshold': validate_float(request.form.get('blur_threshold'), 100.0, 0.0, 5000.0),
-                    'eventimage_cleanup_days': validate_int(request.form.get('eventimage_cleanup_days'), self.config_manager.get('eventimage_cleanup_days', 0), 0, max_value=3650)
+                    'eventimage_cleanup_days': validate_int(
+                        request.form.get('eventimage_cleanup_days'),
+                        self.config_manager.get('eventimage_cleanup_days', 0),
+                        0,
+                        max_value=3650
+                    )
                 }
+
                 combined = {**self.config_manager.config, **new_config}
 
-                # Normalize tuning options
                 if combined.get('face_detection_model') not in ('hog', 'cnn'):
                     combined['face_detection_model'] = 'hog'
 
-                # Mutual exclusivity: stream suspend only allowed when interval is disabled
                 if combined.get('enable_face_recognition_interval', False):
                     combined['enable_stream_suspend'] = False
 
                 self.config_manager.config = combined
                 self.config_manager.save_config()
 
-                # Neustart des Video-Stream Servers erforderlich, um Änderungen anzuwenden
                 with open('/data/signal_file', 'w') as f:
                     f.write("restart")
 
                 return render_template('config_saved.html')
-            else:
-                return render_template(
-                    'config_form.html',
-                    config=self.config_manager.config,
-                    hex_color=hex_color,
-                    transparency_value=transparency_value,
-                    rgba_overlay=rgba_overlay,
-                    persons=persons,
-                    root_images=root_images
-                )
+
+            return render_template(
+                'config_form.html',
+                config=self.config_manager.config,
+                hex_color=hex_color,
+                transparency_value=transparency_value,
+                rgba_overlay=rgba_overlay,
+                persons=persons,
+                root_images=root_images
+            )
 
         @self.app.route('/upload_faces', methods=['POST'])
         def upload_faces():
-            # Dropzone sends the file as 'file'
             if 'file' not in request.files:
                 return jsonify({'error': 'No file found in request'}), 400
 
@@ -397,18 +408,14 @@ class ConfigFrontend:
             if file.filename == '':
                 return jsonify({'error': 'No filename provided'}), 400
 
-            # Person (folder) is required for the new UI; keep legacy behavior if missing
             person_raw = request.form.get('person', '').strip()
             person = sanitize_person_name(person_raw)
 
             if file and allowed_file(file.filename):
-                # keep original extension
                 orig_filename = secure_filename(file.filename)
                 _, ext = os.path.splitext(orig_filename)
                 ext = ext.lower()
 
-                # Build path: folder stays exactly as provided (case-sensitive),
-                # only the uploaded file NAME is normalized + timestamped.
                 if person:
                     person_dir = os.path.join(UPLOAD_FOLDER, person)
                     os.makedirs(person_dir, exist_ok=True)
@@ -417,7 +424,6 @@ class ConfigFrontend:
                     timestamp = current_timestamp_str()
                     filename = f"{person_norm}_{timestamp}{ext}"
 
-                    # Save upload to a real temporary file (NOT inside person_dir), so failed uploads never show up in the UI.
                     fd, tmp_path = tempfile.mkstemp(prefix="faces_upload_", suffix=ext)
                     os.close(fd)
                     file.save(tmp_path)
@@ -431,11 +437,17 @@ class ConfigFrontend:
                             out_size=512,
                             jpg_quality=90,
                         )
-                        # Delete original upload after successful optimization (user request)
+
                         try:
                             os.remove(tmp_path)
                         except Exception as _e:
                             logging.warning(f"Could not delete temporary upload {tmp_path}: {_e}")
+
+                        try:
+                            with open('/data/signal_file', 'w') as f:
+                                f.write("restart")
+                        except Exception as e:
+                            logging.warning(f"Restart-Signal Fehler: {e}")
 
                         return jsonify({
                             'message': f'File {filename} uploaded and processed successfully',
@@ -444,7 +456,6 @@ class ConfigFrontend:
                         }), 200
 
                     except Exception as e:
-                        # Not suitable -> remove temp and reject upload
                         try:
                             os.remove(tmp_path)
                         except Exception:
@@ -453,9 +464,15 @@ class ConfigFrontend:
                         return jsonify({'error': 'This photo is not suitable for facial recognition.'}), 400
 
                 else:
-                    # Legacy fallback: store as-is under root
                     save_path = os.path.join(UPLOAD_FOLDER, orig_filename)
                     file.save(save_path)
+
+                    try:
+                        with open('/data/signal_file', 'w') as f:
+                            f.write("restart")
+                    except Exception as e:
+                        logging.warning(f"Restart-Signal Fehler: {e}")
+
                     return jsonify({'message': f'File {orig_filename} uploaded successfully'}), 200
 
             return jsonify({'error': 'Invalid file type'}), 400
@@ -472,10 +489,8 @@ class ConfigFrontend:
             os.makedirs(person_dir, exist_ok=True)
             return jsonify({'message': f'Person {person} angelegt', 'person': person}), 200
 
-
         @self.app.route('/list-faces', methods=['GET'])
         def list_faces():
-            # Returns the HTML fragment used by the GUI to refresh the persons / thumbnails view.
             persons, root_images = get_known_faces_structure(UPLOAD_FOLDER)
             return render_template('_face_list.html', persons=persons, root_images=root_images)
 
@@ -491,15 +506,12 @@ class ConfigFrontend:
 
             try:
                 shutil.rmtree(person_dir)
-                # The GUI uses standard form POSTs for deleting a person.
-                # A redirect keeps the UX consistent (full page refresh).
-                return jsonify({'status':'ok'})
+                return jsonify({'status': 'ok'})
             except Exception as e:
                 return jsonify({'error': f'Error deleting {person}: {str(e)}'}), 500
 
         @self.app.route('/knownfaces/<path:filename>')
         def knownfaces(filename):
-            # Serve known face images (supports subfolders per person)
             try:
                 file_path = safe_path(UPLOAD_FOLDER, filename)
             except ValueError:
@@ -510,7 +522,6 @@ class ConfigFrontend:
 
         @self.app.route('/delete_image/<path:filename>', methods=['POST'])
         def delete_image(filename):
-            # prevent traversal
             try:
                 file_path = safe_path(UPLOAD_FOLDER, filename)
             except ValueError:
@@ -550,7 +561,6 @@ class ConfigFrontend:
 
         @self.app.route('/event-image/<filename>')
         def event_image(filename):
-            # Basic path traversal protection
             if '..' in filename or filename.startswith('/'):
                 return 'Access denied', 403
 
@@ -566,7 +576,6 @@ class ConfigFrontend:
 
         @self.app.route('/last-event-image')
         def last_event_image():
-            """Redirect to the most recent event image if available."""
             base_dir = os.path.dirname(os.path.abspath(__file__))
             image_path = os.path.join(base_dir, self.config_manager.get('image_path'))
             if not os.path.exists(image_path) or not os.path.isdir(image_path):
@@ -577,11 +586,8 @@ class ConfigFrontend:
             imgs.sort(key=lambda fn: os.path.getmtime(os.path.join(image_path, fn)), reverse=True)
             return redirect(url_for('event_image', filename=imgs[0]))
 
-
-
         @self.app.route('/event_log')
         def event_log():
-            """Return event log entries as JSON list for the Event Log tab (Tabulator)."""
             log_file = self.config_manager.get('log_file', '/data/event_log.json')
             entries = []
             try:
@@ -594,20 +600,18 @@ class ConfigFrontend:
                             try:
                                 entries.append(json.loads(line))
                             except Exception:
-                                # Ignore malformed lines
                                 continue
             except Exception as e:
                 logging.exception("Failed to read event log file: %s", e)
                 return jsonify([])
 
-            # Most recent first
             entries.reverse()
             resp = jsonify(entries)
-            # Prevent browser/proxy caching so the Event Log updates reliably without hard refresh.
             resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
             resp.headers['Pragma'] = 'no-cache'
             resp.headers['Expires'] = '0'
             return resp
+
         @self.app.route('/clean_event_images', methods=['POST'])
         def clean_event_images():
             action = (request.form.get('action') or 'clean').strip().lower()
@@ -626,7 +630,6 @@ class ConfigFrontend:
                 self.config_manager.save_config()
                 return jsonify({'status': 'ok', 'message': 'Saved.', 'days': days_int})
 
-            # CLEAN uses saved config only (save required)
             days_int = int(self.config_manager.get('eventimage_cleanup_days', 0) or 0)
             if days_int <= 0:
                 return jsonify({'status': 'error', 'message': 'Cleanup is disabled (set days > 0 and save first).'}), 400
@@ -640,6 +643,7 @@ class ConfigFrontend:
             deleted = 0
             deleted_files = []
             errors = 0
+
             for fn in os.listdir(image_path):
                 if not fn.lower().endswith(('.jpg', '.jpeg', '.png')):
                     continue
@@ -652,7 +656,6 @@ class ConfigFrontend:
                 except Exception:
                     errors += 1
 
-            # Prune event_log.json to remove entries whose images were deleted.
             try:
                 if deleted_files:
                     log_file = self.config_manager.get('log_file', '/data/event_log.json')
@@ -662,6 +665,7 @@ class ConfigFrontend:
 
             msg = f'Deleted {deleted} image(s).' + (f' ({errors} error(s))' if errors else '')
             return jsonify({'status': 'ok', 'message': msg, 'deleted': deleted, 'errors': errors, 'days': days_int})
+
     def run(self):
         """Run the configuration frontend (port 5000)."""
         self.app.run(
@@ -669,5 +673,5 @@ class ConfigFrontend:
             port=5000,
             threaded=True,
             use_reloader=False,
-            debug=True,
+            debug=False,
         )

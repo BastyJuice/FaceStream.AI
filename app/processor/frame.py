@@ -6,6 +6,154 @@ import queue
 import time
 import os
 import json
+import concurrent.futures
+import multiprocessing
+import gc
+import copy
+import numpy as np
+from collections import deque
+
+
+def _clip_box(top, right, bottom, left, width, height):
+    top = max(0, min(int(top), height))
+    right = max(0, min(int(right), width))
+    bottom = max(0, min(int(bottom), height))
+    left = max(0, min(int(left), width))
+    return top, right, bottom, left
+
+
+def _roi_blur_score(frame_bgr, face_location):
+    try:
+        h, w = frame_bgr.shape[:2]
+        top, right, bottom, left = _clip_box(*face_location, width=w, height=h)
+        roi = frame_bgr[top:bottom, left:right]
+        if roi.size == 0:
+            return 0.0
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    except Exception:
+        return 0.0
+
+
+def _apply_clahe_to_face_regions(frame_bgr, face_locations):
+    try:
+        enhanced = frame_bgr.copy()
+        h, w = enhanced.shape[:2]
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+        for face_location in face_locations:
+            top, right, bottom, left = _clip_box(*face_location, width=w, height=h)
+            roi = enhanced[top:bottom, left:right]
+            if roi.size == 0:
+                continue
+
+            ycrcb = cv2.cvtColor(roi, cv2.COLOR_BGR2YCrCb)
+            y, cr, cb = cv2.split(ycrcb)
+            y2 = clahe.apply(y)
+            merged = cv2.merge((y2, cr, cb))
+            enhanced[top:bottom, left:right] = cv2.cvtColor(merged, cv2.COLOR_YCrCb2BGR)
+
+        return enhanced
+    except Exception:
+        return frame_bgr
+
+
+def _detect_faces_worker(frame, cfg):
+    """
+    CPU-intensive face detection/encoding in a separate process.
+    Returns filtered face_locations, face_encodings and the scale_factor used.
+    """
+    try:
+        scale_factor = float(cfg.get('face_scale_factor', 0.75))
+
+        # Optional trigger-time runtime scale boost. Useful when triggers run at low FPS
+        # and we can afford a bit more detail without making the live stream stutter.
+        if cfg.get('__trigger_active', False):
+            trigger_scale_override = cfg.get('__trigger_scale_override', None)
+            if trigger_scale_override is not None:
+                try:
+                    scale_factor = float(trigger_scale_override)
+                except Exception:
+                    pass
+
+        if scale_factor < 0.25:
+            scale_factor = 0.25
+        if scale_factor > 1.0:
+            scale_factor = 1.0
+
+        small_frame = cv2.resize(frame, (0, 0), fx=scale_factor, fy=scale_factor)
+        working_frame = small_frame
+
+        model = str(cfg.get('face_detection_model', 'hog')).lower().strip()
+        if model not in ('hog', 'cnn'):
+            model = 'hog'
+
+        try:
+            upsample = int(cfg.get('face_upsample_times', 1))
+        except Exception:
+            upsample = 1
+        upsample = max(0, min(upsample, 3))
+
+        rgb_small_frame = working_frame[:, :, ::-1]
+        detected_locations = face_recognition.face_locations(
+            rgb_small_frame,
+            number_of_times_to_upsample=upsample,
+            model=model
+        )
+
+        if not detected_locations:
+            return {
+                'face_locations': [],
+                'face_encodings': [],
+                'scale_factor': scale_factor,
+            }
+
+        # Optional ROI blur filter: score only the detected face area, not the full frame.
+        filtered_locations = []
+        blur_scores = []
+        if cfg.get('enable_blur_filter', False):
+            try:
+                blur_threshold = float(cfg.get('blur_threshold', 100.0))
+            except Exception:
+                blur_threshold = 100.0
+
+            for loc in detected_locations:
+                score = _roi_blur_score(working_frame, loc)
+                if score >= blur_threshold:
+                    filtered_locations.append(loc)
+                    blur_scores.append(score)
+        else:
+            filtered_locations = list(detected_locations)
+
+        if not filtered_locations:
+            return {
+                'face_locations': [],
+                'face_encodings': [],
+                'scale_factor': scale_factor,
+            }
+
+        # Optional ROI CLAHE: enhance only detected face regions before encoding.
+        encoding_frame = working_frame
+        if cfg.get('enable_clahe', False):
+            encoding_frame = _apply_clahe_to_face_regions(working_frame, filtered_locations)
+
+        rgb_encoding_frame = encoding_frame[:, :, ::-1]
+        face_encodings = face_recognition.face_encodings(rgb_encoding_frame, filtered_locations)
+
+        return {
+            'face_locations': filtered_locations,
+            'face_encodings': face_encodings,
+            'scale_factor': scale_factor,
+            'blur_scores': blur_scores,
+        }
+
+    except Exception as e:
+        return {
+            'face_locations': [],
+            'face_encodings': [],
+            'scale_factor': 1.0,
+            'error': str(e),
+        }
 
 
 class FrameProcessor(threading.Thread):
@@ -23,7 +171,8 @@ class FrameProcessor(threading.Thread):
         self.running = True
         self.trackers = []
         self.notification_service = notification_service
-        self.frame_count = 0  # Zähler für die Frame-Intervalle
+        self.frame_count = 0
+
         # Manual trigger state
         self.trigger_file = os.path.join('/data', 'manual_trigger.json')
         self._trigger_mtime = 0.0
@@ -38,20 +187,46 @@ class FrameProcessor(threading.Thread):
         self._last_trigger_active_flag = False
         self._trigger_saw_face = False
 
-        # Fast config snapshot for the realtime loop (avoid filesystem stat() in hot path).
+        # Best-of-frames for manual triggers
+        self._trigger_frame_candidates = deque(maxlen=5)
+        self._trigger_candidate_poll_interval = 0.05
+        self._trigger_min_face_size_for_score = 24  # in scaled candidate frame
+        self._trigger_gamma = 1.3
+
+        # Fast config snapshot for the realtime loop
         self._cfg = {}
-        self._cfg_refresh_interval = 1.0  # seconds
+        self._cfg_refresh_interval = 1.0
         self._cfg_next_refresh = 0.0
 
-        # Prime snapshot once so we don't have to wait for the first interval.
         try:
             self._cfg = self.config_manager.get_snapshot()
         except Exception:
             self._cfg = {}
 
+        self._executor_recycle_every = max(1, int(config_manager.get('worker_recycle_every', 200) or 200))
+        self._processed_jobs_since_recycle = 0
+        self.executor = self._create_executor()
+
+    def _create_executor(self):
+        return concurrent.futures.ProcessPoolExecutor(
+            max_workers=1,
+            mp_context=multiprocessing.get_context("spawn")
+        )
+
+    def _maybe_recycle_executor(self):
+        if self._processed_jobs_since_recycle < self._executor_recycle_every:
+            return
+        try:
+            old_executor = self.executor
+            self.executor = self._create_executor()
+            self._processed_jobs_since_recycle = 0
+            old_executor.shutdown(wait=False, cancel_futures=True)
+            gc.collect()
+            logging.info("Recycled face-detection worker process to cap memory growth.")
+        except Exception as e:
+            logging.warning(f"Executor recycle failed: {e}")
 
     def _refresh_cfg_if_needed(self):
-        """Refresh cached config snapshot at most every _cfg_refresh_interval seconds."""
         now = time.monotonic()
         if now < self._cfg_next_refresh:
             return
@@ -62,16 +237,18 @@ class FrameProcessor(threading.Thread):
         self._cfg = cfg
         self._cfg_next_refresh = now + self._cfg_refresh_interval
 
-        # Keep frequently used fields in sync (still cheap because this runs ~1x/sec)
         self.overlay_transparency = cfg.get('overlay_transparency', self.overlay_transparency)
         self.overlay_color = cfg.get('overlay_color', self.overlay_color)
-        self.enable_face_recognition_interval = cfg.get('enable_face_recognition_interval', self.enable_face_recognition_interval)
-        self.face_recognition_interval = cfg.get('face_recognition_interval', self.face_recognition_interval)
+        self.enable_face_recognition_interval = cfg.get(
+            'enable_face_recognition_interval',
+            self.enable_face_recognition_interval
+        )
+        self.face_recognition_interval = cfg.get(
+            'face_recognition_interval',
+            self.face_recognition_interval
+        )
 
-
-    
     def _refresh_trigger(self):
-        """Reload manual trigger file if changed and update trigger window state."""
         try:
             if not os.path.exists(self.trigger_file):
                 return
@@ -96,35 +273,31 @@ class FrameProcessor(threading.Thread):
 
             force_notify = data.get('force_notify', True)
 
-            # Clamp
             duration = max(0.5, min(duration, 120.0))
             fps = max(0.1, min(fps, 20.0))
 
-            # Grace is used by streaming/overlay logic; recognition/fallback uses duration only
             grace = float(self.config_manager.get('stream_suspend_grace_seconds', 10) or 0)
 
             self._trigger_active_until = triggered_at + duration + max(0.0, grace)
             self._trigger_recognition_until = triggered_at + duration
             self._trigger_fps = fps
-            self._trigger_next_allowed = 0.0  # allow immediately
+            self._trigger_next_allowed = 0.0
             self._trigger_stop_on_match = stop_on_match
             self._trigger_force_notify_pending = bool(force_notify)
 
-            # Reset per-trigger state
             self._trigger_start_unknown_sent = False
             self._trigger_final_event_sent = False
             self._trigger_saw_face = False
+            self._trigger_frame_candidates.clear()
 
             logging.info(
-                f"Manual trigger activated: duration={duration}s fps={fps} stop_on_match={stop_on_match} force_notify={force_notify}"
+                f"Manual trigger activated: duration={duration}s fps={fps} "
+                f"stop_on_match={stop_on_match} force_notify={force_notify}"
             )
         except Exception as e:
             logging.error(f"Failed to refresh manual trigger: {e}")
 
-    
-    
     def _stop_trigger_systemwide(self):
-        """Stop the manual trigger for all components by clearing state and removing the trigger file."""
         self._trigger_active_until = 0.0
         self._trigger_recognition_until = 0.0
         try:
@@ -134,7 +307,6 @@ class FrameProcessor(threading.Thread):
             logging.warning(f"Failed to remove trigger file: {e}")
 
     def _apply_clahe(self, frame_bgr):
-        """Optional contrast enhancement for low-light scenes."""
         try:
             ycrcb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2YCrCb)
             y, cr, cb = cv2.split(ycrcb)
@@ -146,16 +318,199 @@ class FrameProcessor(threading.Thread):
             return frame_bgr
 
     def _blur_score(self, frame_bgr):
-        """Higher means sharper."""
         try:
             gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
             return float(cv2.Laplacian(gray, cv2.CV_64F).var())
         except Exception:
             return 0.0
 
+    def _adjust_gamma(self, image, gamma=1.3):
+        try:
+            inv_gamma = 1.0 / float(gamma)
+            table = np.array(
+                [((i / 255.0) ** inv_gamma) * 255 for i in range(256)],
+                dtype="uint8"
+            )
+            return cv2.LUT(image, table)
+        except Exception:
+            return image
+
+    def _get_trigger_bestof_plan(self):
+        """
+        Dynamic best-of tuning for trigger processing.
+        Sample timing is handled separately in _collect_trigger_candidates():
+        fast on first attempt, slower afterwards for better quality.
+        """
+        fps = max(0.1, float(self._trigger_fps or 1.0))
+
+        if fps <= 1.0:
+            max_candidates = 5
+            runtime_scale = 0.90
+        elif fps <= 2.0:
+            max_candidates = 5
+            runtime_scale = 0.85
+        elif fps <= 3.0:
+            max_candidates = 4
+            runtime_scale = 0.80
+        else:
+            max_candidates = 3
+            runtime_scale = None
+
+        return {
+            'max_candidates': max_candidates,
+            'runtime_scale': runtime_scale,
+        }
+
+    def _collect_trigger_candidates(self, first_frame):
+        """
+        Collect a few fresh frames after trigger allowance.
+        Fast on the first attempt, then allow a bit more time for better quality.
+        """
+        plan = self._get_trigger_bestof_plan()
+        max_candidates = int(plan['max_candidates'])
+
+        # schneller Start beim ersten Versuch, danach mehr Qualität
+        if not self._trigger_saw_face and not self._trigger_final_event_sent:
+            sample_window = 0.12
+        else:
+            sample_window = 0.35
+
+        candidates = [first_frame]
+        deadline = time.monotonic() + sample_window
+
+        while len(candidates) < max_candidates and time.monotonic() < deadline:
+            remaining = max(0.0, deadline - time.monotonic())
+            timeout = min(self._trigger_candidate_poll_interval, remaining)
+            if timeout <= 0:
+                break
+            try:
+                next_frame = self.frame_queue.get(timeout=timeout)
+            except queue.Empty:
+                break
+            except Exception:
+                break
+
+            if next_frame is not None:
+                candidates.append(next_frame)
+
+        return candidates
+
+    def _candidate_face_score(self, frame):
+        """
+        Score trigger candidates by the quality of the largest detected face,
+        not by global image sharpness. This is much more robust for intercom
+        scenes with bright background / cars / sky.
+        """
+        try:
+            cfg = self._cfg or {}
+            base_scale = float(cfg.get('face_scale_factor', 0.9))
+            base_scale = max(0.25, min(base_scale, 1.0))
+
+            # Cheap scoring pass: use a moderate scale and HOG with no upsample.
+            plan = self._get_trigger_bestof_plan()
+            runtime_scale = plan.get('runtime_scale', None)
+
+            if runtime_scale is not None:
+                scale_factor = max(base_scale, float(runtime_scale))
+            else:
+                scale_factor = base_scale
+
+            small = cv2.resize(frame, (0, 0), fx=scale_factor, fy=scale_factor)
+            rgb = small[:, :, ::-1]
+
+            locations = face_recognition.face_locations(
+                rgb,
+                number_of_times_to_upsample=0,
+                model='hog'
+            )
+
+            if not locations:
+                return -1.0
+
+            largest = max(
+                locations,
+                key=lambda loc: (loc[2] - loc[0]) * (loc[1] - loc[3])
+            )
+            top, right, bottom, left = largest
+            face_w = max(1, right - left)
+            face_h = max(1, bottom - top)
+
+            if face_w < self._trigger_min_face_size_for_score or face_h < self._trigger_min_face_size_for_score:
+                return -0.5
+
+            blur = _roi_blur_score(small, largest)
+            face_area = float(face_w * face_h)
+
+            # Brightness score: prefer faces that are not extremely dark.
+            roi = small[top:bottom, left:right]
+            brightness = 0.0
+            if roi.size > 0:
+                gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                brightness = float(np.mean(gray))
+
+            # Score mix:
+            # - blur dominant
+            # - face size helpful
+            # - brightness small bonus
+            return blur + (face_area * 0.02) + (brightness * 0.15)
+
+        except Exception:
+            return -1.0
+
+    def _select_best_trigger_frame(self, frame):
+        candidates = self._collect_trigger_candidates(frame)
+        best_frame = frame
+        best_score = -1.0
+
+        self._trigger_frame_candidates.clear()
+
+        for candidate in candidates:
+            if candidate is None:
+                continue
+
+            score = self._candidate_face_score(candidate)
+            self._trigger_frame_candidates.append((score, candidate))
+
+            if score > best_score:
+                best_score = score
+                best_frame = candidate
+
+        if best_score < 0:
+            # Fallback: no face found in the cheap scoring pass.
+            # Still prefer the globally sharpest candidate.
+            sharpest_frame = frame
+            sharpest_score = -1.0
+            for candidate in candidates:
+                if candidate is None:
+                    continue
+                score = self._blur_score(candidate)
+                if score > sharpest_score:
+                    sharpest_score = score
+                    sharpest_frame = candidate
+            best_frame = sharpest_frame
+
+        return best_frame
+
+    def _build_detection_cfg(self, trigger_active: bool = False):
+        cfg = copy.deepcopy(self._cfg or {})
+        if not trigger_active:
+            return cfg
+
+        plan = self._get_trigger_bestof_plan()
+        runtime_scale = plan.get('runtime_scale', None)
+
+        cfg['__trigger_active'] = True
+        cfg['__trigger_scale_override'] = runtime_scale
+
+        return cfg
+
     def _create_tracker(self):
-        """Create an OpenCV tracker with fallbacks for environments without opencv-contrib."""
-        for ctor in ("TrackerKCF_create", "TrackerCSRT_create", "TrackerMOSSE_create", "TrackerMIL_create"):
+        for ctor in (
+            "TrackerKCF_create",
+            "TrackerCSRT_create",
+            "TrackerMOSSE_create",
+            "TrackerMIL_create",
+        ):
             fn = getattr(cv2, ctor, None)
             if callable(fn):
                 try:
@@ -165,20 +520,15 @@ class FrameProcessor(threading.Thread):
         return None
 
     def run(self):
-        # IMPORTANT: Never let this thread die silently. Any exception here kills face recognition,
-        # notifications, snapshots and event log updates.
         while self.running:
             try:
-                # Use a timeout so stop() can terminate the thread even when the
-                # frame queue is empty (otherwise .get() blocks forever).
                 frame = self.frame_queue.get(timeout=0.5)
                 if frame is not None:
                     self._refresh_trigger()
                     self._refresh_cfg_if_needed()
                     now = time.time()
                     trigger_active = now <= self._trigger_active_until
-                    
-                    # Trigger-Ende erkennen (ON -> OFF) und Cleanup laufen lassen
+
                     if (not trigger_active) and self._last_trigger_active_flag:
                         try:
                             if hasattr(self.notification_service, 'cleanup_now'):
@@ -186,22 +536,16 @@ class FrameProcessor(threading.Thread):
                         except Exception as e:
                             logging.warning(f"Post-trigger cleanup failed: {e}")
 
-                    # Status für nächsten Loop merken
                     self._last_trigger_active_flag = trigger_active
 
-                    # On manual trigger start: send a *silent* Unknown to Loxone only (no event log),
-                    # so Loxone doesn't keep an old name displayed.
                     if trigger_active and (not self._trigger_start_unknown_sent):
                         try:
-                            # Loxone-only send (no event log)
                             if hasattr(self.notification_service, 'send_loxone_name_only'):
                                 self.notification_service.send_loxone_name_only('Unknown')
                         except Exception:
                             pass
                         self._trigger_start_unknown_sent = True
 
-                    # If recognition duration elapsed and we still haven't sent a final event:
-                    # send exactly one Unknown *only if we saw at least one face during the trigger*.
                     if trigger_active and (now >= self._trigger_recognition_until) and (not self._trigger_final_event_sent):
                         if self._trigger_saw_face:
                             try:
@@ -211,22 +555,20 @@ class FrameProcessor(threading.Thread):
                             self._trigger_final_event_sent = True
                         self._stop_trigger_systemwide()
                         trigger_active = False
+
                     trigger_allow = trigger_active and (now >= self._trigger_next_allowed)
 
                     if trigger_allow:
-                        # Throttle recognition during trigger window
                         self._trigger_next_allowed = now + (1.0 / self._trigger_fps)
                         processed_frame = self.process_frame(frame, trigger_active=True)
                     elif self.enable_face_recognition_interval and (self.frame_count % self.face_recognition_interval == 0):
                         processed_frame = self.process_frame(frame, trigger_active=False)
                     else:
-                        # Always update trackers between detections
                         processed_frame = self.update_trackers(frame)
 
                     try:
                         self.processed_frame_queue.put_nowait(processed_frame)
                     except queue.Full:
-                        # Drop older processed frames if the queue is full
                         while not self.processed_frame_queue.empty():
                             try:
                                 self.processed_frame_queue.get_nowait()
@@ -241,9 +583,10 @@ class FrameProcessor(threading.Thread):
                 self.frame_count += 1
                 if self.frame_count % 100 == 0:
                     queue_size = self.frame_queue.qsize()
-                    logging.debug(f"Current queue size: {queue_size}; processed frames: {self.frame_count}")
+                    logging.debug(
+                        f"Current queue size: {queue_size}; processed frames: {self.frame_count}"
+                    )
 
-                # Avoid overflow
                 if self.frame_count >= 1000000:
                     self.frame_count = 0
 
@@ -256,102 +599,104 @@ class FrameProcessor(threading.Thread):
 
     def stop(self):
         self.running = False
+        try:
+            self.executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
 
     def process_frame(self, frame, trigger_active: bool = False):
         start_time = time.time()
         try:
             self._refresh_cfg_if_needed()
-            cfg = self._cfg or {}
 
-            scale_factor = float(cfg.get('face_scale_factor', 0.75))
-            # Clamp to reasonable range
-            if scale_factor < 0.25:
-                scale_factor = 0.25
-            if scale_factor > 1.0:
-                scale_factor = 1.0
-            small_frame = cv2.resize(frame, (0, 0), fx=scale_factor, fy=scale_factor)
+            cfg = self._build_detection_cfg(trigger_active=trigger_active)
 
-            # Optional blur filter: skip recognition on very blurry frames
-            if cfg.get('enable_blur_filter', False):
-                try:
-                    blur_threshold = float(cfg.get('blur_threshold', 100.0))
-                except Exception:
-                    blur_threshold = 100.0
-                score = self._blur_score(small_frame)
-                if score < blur_threshold:
-                    # No detection this round; just return tracker-updated frame
-                    return frame
-
-            # Optional low-light enhancement
-            if cfg.get('enable_clahe', False):
-                small_frame = self._apply_clahe(small_frame)
-
-            # Convert small frame to RGB from BGR, which OpenCV uses
-            rgb_small_frame = small_frame[:, :, ::-1]
-            
-            # Reset trackers on new detection
             self.trackers = []
-            
-            # Detect faces
-            model = str(cfg.get('face_detection_model', 'hog')).lower().strip()
-            if model not in ('hog', 'cnn'):
-                model = 'hog'
-            # Upsampling helps detect smaller faces (at the cost of CPU).
-            # 0 = no upsample, 1–2 = common, 3 = heavy.
-            try:
-                upsample = int(cfg.get('face_upsample_times', 1))
-            except Exception:
-                upsample = 1
-            upsample = max(0, min(upsample, 3))
 
-            face_locations = face_recognition.face_locations(
-                rgb_small_frame,
-                number_of_times_to_upsample=upsample,
-                model=model
-            )
+            detection_frame = frame
+            if trigger_active:
+                # erstes Frame sofort ohne Best-of
+                if not self._trigger_saw_face and not self._trigger_final_event_sent:
+                    detection_frame = frame
+                else:
+                    detection_frame = self._select_best_trigger_frame(frame)
+
+                detection_frame = self._adjust_gamma(
+                    detection_frame,
+                    gamma=self._trigger_gamma
+                )
+
+            future = self.executor.submit(_detect_faces_worker, detection_frame, cfg)
+            try:
+                result = future.result(timeout=10)
+            finally:
+                del future
+
+            self._processed_jobs_since_recycle += 1
+            self._maybe_recycle_executor()
+
+            face_locations = result.get('face_locations', [])
+            face_encodings = result.get('face_encodings', [])
+            scale_factor = float(result.get('scale_factor', 1.0))
+
+            if 'error' in result:
+                logging.debug(f"Face detection worker warning: {result['error']}")
+
             if trigger_active and face_locations:
                 self._trigger_saw_face = True
-            face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
-            
-            # Create a copy of the original frame to draw on
+
         except Exception as e:
             logging.exception(f"Face detection/encoding failed: {e}")
             return frame
 
-        marked_frame = frame.copy()
+        marked_frame = detection_frame.copy()
 
-        # Manual trigger behavior:
-        # Only create images/events if at least one face was detected.
-        # (No snapshot/event when trigger fires but no person is in frame.)
+        try:
+            max_faces = int(cfg.get('max_faces_per_frame', 0))
+        except Exception:
+            max_faces = 0
+
+        if max_faces > 0:
+            face_locations = face_locations[:max_faces]
+            face_encodings = face_encodings[:max_faces]
 
         for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
-            name = self.face_loader.get_name(face_encoding)
-            # Initialize a new tracker for each face
+            try:
+                name = self.face_loader.get_name(face_encoding)
+            except Exception as e:
+                logging.debug(f"Name lookup failed: {e}")
+                name = 'Unknown'
+
             tracker = self._create_tracker()
-            # Convert face location from small frame scale to original scale
-            # Skalierung zurücksetzen
-            # IMPORTANT: scale_factor is typically not a clean divisor (e.g. 0.75).
-            # Using int(1/scale_factor) truncates (1/0.75 -> 1) and breaks the rescaling.
+
             scale_multiplier = 1.0 / float(scale_factor)
             top = int(round(top * scale_multiplier))
             right = int(round(right * scale_multiplier))
             bottom = int(round(bottom * scale_multiplier))
             left = int(round(left * scale_multiplier))
             bbox = (left, top, right - left, bottom - top)
+
             if tracker is not None:
-                tracker.init(frame, bbox)
-                self.trackers.append({'tracker': tracker, 'name': name})
-            # Draw rectangles and notify
+                try:
+                    tracker.init(detection_frame, bbox)
+                    self.trackers.append({'tracker': tracker, 'name': name})
+                except Exception as e:
+                    logging.debug(f"Tracker init failed for {name}: {e}")
+
             if cfg.get('enable_face_overlay', True):
-                marked_frame = self.draw_rectangle_with_name(marked_frame, top, right, bottom, left, name)
-            # Trigger-aware notification: allow one forced notification per manual trigger
+                marked_frame = self.draw_rectangle_with_name(
+                    marked_frame,
+                    top,
+                    right,
+                    bottom,
+                    left,
+                    name
+                )
+
             now = time.time()
-            trigger_active = now <= self._trigger_active_until
-            
-            if trigger_active:
-                # During a manual trigger we log exactly ONE event:
-                # - known name immediately on first match (and optionally stop_on_match)
-                # - otherwise Unknown once at trigger end (handled above)
+            trigger_active_now = now <= self._trigger_active_until
+
+            if trigger_active_now:
                 if (name != 'Unknown') and (not self._trigger_final_event_sent):
                     force = True
                     if self._trigger_force_notify_pending:
@@ -379,7 +724,8 @@ class FrameProcessor(threading.Thread):
         self._refresh_cfg_if_needed()
         cfg = self._cfg or {}
         new_trackers = []
-        updated_frame = frame.copy()  # Erstelle eine Kopie für Updates
+        updated_frame = frame.copy()
+
         for tracked in self.trackers:
             tracker = tracked['tracker']
             name = tracked['name']
@@ -387,29 +733,29 @@ class FrameProcessor(threading.Thread):
             if success:
                 left, top, width, height = [int(v) for v in box]
                 right, bottom = left + width, top + height
-                # Respect overlay toggle for tracker-only updates as well
                 if cfg.get('enable_face_overlay', True):
                     try:
-                        updated_frame = self.draw_rectangle_with_name(updated_frame, top, right, bottom, left, name)
+                        updated_frame = self.draw_rectangle_with_name(
+                            updated_frame,
+                            top,
+                            right,
+                            bottom,
+                            left,
+                            name
+                        )
                     except Exception as e:
                         logging.debug(f"Failed to draw tracker overlay for {name}: {e}")
                 new_trackers.append(tracked)
             else:
                 logging.debug(f"Tracking failed for {name}, removing tracker.")
+
         self.trackers = new_trackers
         return updated_frame
 
     def draw_rectangle_with_name(self, frame, top, right, bottom, left, name):
-        """Draw a semi-transparent filled face box + name label.
-
-        Performance note:
-        We blend only the region-of-interest (ROI) of the face box instead of the full frame.
-        This avoids a full-frame copy + addWeighted() on every face and reduces CPU significantly.
-        """
         try:
             h, w = frame.shape[:2]
 
-            # Clamp coordinates to frame bounds
             left_i = max(0, min(int(left), w - 1))
             right_i = max(0, min(int(right), w))
             top_i = max(0, min(int(top), h - 1))
@@ -418,7 +764,7 @@ class FrameProcessor(threading.Thread):
             if right_i <= left_i or bottom_i <= top_i:
                 return frame
 
-            border_color = (255, 255, 255)  # white
+            border_color = (255, 255, 255)
             border_thickness = 1
             transparency = float(self.overlay_transparency)
             if transparency < 0.0:
@@ -426,10 +772,8 @@ class FrameProcessor(threading.Thread):
             if transparency > 1.0:
                 transparency = 1.0
 
-            # Convert overlay color from RGB (config) to BGR (OpenCV)
             overlay_color = tuple(int(c) for c in self.overlay_color[::-1])
 
-            # Draw border (outline) directly (cheap)
             cv2.rectangle(
                 frame,
                 (max(0, left_i - border_thickness), max(0, top_i - border_thickness)),
@@ -438,23 +782,18 @@ class FrameProcessor(threading.Thread):
                 border_thickness,
             )
 
-            # ROI-only alpha blend for filled rectangle
             roi = frame[top_i:bottom_i, left_i:right_i]
             if roi.size == 0:
                 return frame
 
-            # Make a solid overlay for the ROI
             overlay = roi.copy()
             overlay[:, :] = overlay_color
 
-            # Keep legacy semantics: transparency=0 => fully colored overlay; transparency=1 => original
             cv2.addWeighted(overlay, 1.0 - transparency, roi, transparency, 0.0, roi)
 
-            # Text
             font_scale = 1.0
             font_thickness = 2
 
-            # Prefer below the box, but if it would go out of bounds, place above.
             text_y = bottom_i + border_thickness + 25
             if text_y > h - 5:
                 text_y = max(15, top_i - 10)
@@ -469,7 +808,6 @@ class FrameProcessor(threading.Thread):
                 font_thickness,
             )
         except Exception as e:
-            # Never raise from overlay rendering; return the original frame unchanged.
             logging.debug(f"Failed to draw rectangle with name (ROI overlay): {e}")
             return frame
 

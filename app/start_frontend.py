@@ -1,36 +1,56 @@
 import logging
-
-from server.config.frontend import ConfigFrontend
 import os
-from config.manager import ConfigManager
-from config.manager import initialize_app_structure
-from config.manager import data_folder
-from config.manager import known_faces_folder
-from config.manager import config_file
 import json
 
+from server.config.frontend import ConfigFrontend
+from config.manager import (
+    ConfigManager,
+    initialize_app_structure,
+    data_folder,
+    known_faces_folder,
+    config_file,
+)
+
 # logging.basicConfig(level=logging.DEBUG)
-default_config = initialize_app_structure()
 
-# Erstellen des 'data'-Ordners, falls nicht vorhanden
-if not os.path.exists(data_folder):
-    os.makedirs(data_folder)
 
-# Erstellen des 'knownfaces'-Ordners, falls nicht vorhanden
-if not os.path.exists(known_faces_folder):
-    os.makedirs(known_faces_folder)
+def ensure_app_setup():
+    """Stellt sicher, dass Ordner und Config existieren."""
+    try:
+        default_config = initialize_app_structure()
 
-# Erstellen der 'config.json'-Datei mit Standardwerten, falls nicht vorhanden
-if not os.path.isfile(config_file):
-    with open(config_file, 'w') as config_file_handle:
-        json.dump(default_config, config_file_handle, indent=4)
+        # data Ordner
+        os.makedirs(data_folder, exist_ok=True)
+
+        # knownfaces Ordner
+        os.makedirs(known_faces_folder, exist_ok=True)
+
+        # config.json
+        if not os.path.isfile(config_file):
+            with open(config_file, 'w') as f:
+                json.dump(default_config, f, indent=4)
+            logging.info("Created default config.json")
+
+    except Exception as e:
+        logging.exception(f"Failed to initialize app structure: {e}")
+        raise
 
 
 def main():
-    config_manager = ConfigManager(config_file)
+    try:
+        ensure_app_setup()
 
-    config_server = ConfigFrontend(config_manager)
-    config_server.run()
+        config_manager = ConfigManager(config_file)
+        config_manager.load_config()
+
+        config_server = ConfigFrontend(config_manager)
+        config_server.run()
+
+    except KeyboardInterrupt:
+        logging.info("Config server stopped by user.")
+    except Exception as e:
+        logging.exception(f"Fatal error in config frontend: {e}")
+        raise
 
 
 if __name__ == '__main__':
